@@ -26,15 +26,17 @@ enum EdgeType {
 /// Finds the LUB type and adjustment paths for each node.
 ///
 /// Returns `Some((lub, adjustments))` if a common LUB exists for all nodes,
-/// where `adjustments[i]` is the path from node `i` to the LUB.
+/// where `adjustments[node_id]` is the path from that node to the LUB.
+/// Each step in the path is (next_node, edge_type) to reach that node.
 /// Returns `None` if no common LUB can be found.
 fn find_lub(nodes: &[NodeId], deref: &Graph, unsize: &Graph) -> Option<(NodeId, Vec<Adjustment>)> {
-    let mut all_adjustments = Vec::with_capacity(nodes.len());
+    let max_node = *nodes.iter().max()?;
+    let mut adjustments_by_node = vec![Adjustment { path: vec![] }; max_node + 1];
     let mut common_lub = None;
 
-    for &node in nodes {
+    for &start_node in nodes {
         let mut reachable = HashMap::new();
-        let mut queue = vec![(node, vec![])];
+        let mut queue = vec![(start_node, vec![])];
 
         while let Some((current, path)) = queue.pop() {
             if reachable.contains_key(&current) {
@@ -44,12 +46,12 @@ fn find_lub(nodes: &[NodeId], deref: &Graph, unsize: &Graph) -> Option<(NodeId, 
 
             for &next in deref.neighbors(current) {
                 let mut new_path = path.clone();
-                new_path.push((current, EdgeType::Deref));
+                new_path.push((next, EdgeType::Deref));
                 queue.push((next, new_path));
             }
             for &next in unsize.neighbors(current) {
                 let mut new_path = path.clone();
-                new_path.push((current, EdgeType::Unsize));
+                new_path.push((next, EdgeType::Unsize));
                 queue.push((next, new_path));
             }
         }
@@ -65,10 +67,10 @@ fn find_lub(nodes: &[NodeId], deref: &Graph, unsize: &Graph) -> Option<(NodeId, 
         }
 
         let path = reachable.get(&lub).cloned().unwrap_or_default();
-        all_adjustments.push(Adjustment { path });
+        adjustments_by_node[start_node] = Adjustment { path };
     }
 
-    Some((common_lub?, all_adjustments))
+    Some((common_lub?, adjustments_by_node))
 }
 
 /// Writes graphs to a file for inspection.
@@ -113,26 +115,19 @@ fn main() -> anyhow::Result<()> {
 
                 let orderings: Vec<Vec<_>> = (0..n).permutations(n).collect();
                 let first = find_lub(&orderings[0], deref, unsize);
-                writeln!(file, "{di}-{ui}: {first:?}")?;
+                writeln!(file, "{di}-{ui}")?;
 
-                let mismatch = orderings[1..]
-                    .iter()
-                    .any(|ordering| find_lub(ordering, deref, unsize) != first);
-
-                if mismatch {
-                    println!("\n!!! MISMATCH FOUND !!!");
-                    println!("Deref graph #{}: {:?}", di, deref.to_adj_list());
-                    println!("Unsize graph #{}: {:?}", ui, unsize.to_adj_list());
-                    let results: Vec<_> = orderings
-                        .iter()
-                        .map(|ordering| (ordering, find_lub(ordering, deref, unsize)))
-                        .collect();
-                    for (ordering, result) in results {
-                        println!("  Ordering: {:?}", ordering);
-                        println!("  Result: {:?}", result);
-                        writeln!(file, "  {ordering:?}: {result:?}")?;
+                for order in orderings.iter() {
+                    let new_lub = find_lub(&order, deref, unsize);
+                    writeln!(file, "  {order:?}: {new_lub:?}")?;
+                    if new_lub != first {
+                        println!("\n!!! MISMATCH FOUND !!!");
+                        println!("Deref graph #{}: {:?}", di, deref);
+                        println!("Unsize graph #{}: {:?}", ui, unsize);
+                        println!("  {:?}: {first:?}", &orderings[0]);
+                        println!("  {:?}: {new_lub:?}", &order);
+                        return Err(anyhow::anyhow!("Mismatch found"));
                     }
-                    return Err(anyhow::anyhow!("Mismatch found"));
                 }
             }
         }
