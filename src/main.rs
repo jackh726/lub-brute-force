@@ -1,123 +1,5 @@
-use itertools::Itertools;
-use std::collections::{HashMap, HashSet};
-
-type NodeId = usize;
-type Graph = Vec<Vec<NodeId>>;
-
-fn is_weakly_connected(n: usize, edges: &[(NodeId, NodeId)]) -> bool {
-    let mut adj = vec![vec![]; n];
-    for &(from, to) in edges {
-        adj[from].push(to);
-        adj[to].push(from);
-    }
-    let mut visited = vec![false; n];
-    let mut stack = vec![0];
-    visited[0] = true;
-    while let Some(node) = stack.pop() {
-        for &neighbor in &adj[node] {
-            if !visited[neighbor] {
-                visited[neighbor] = true;
-                stack.push(neighbor);
-            }
-        }
-    }
-    visited.iter().all(|&v| v)
-}
-
-fn generate_deref_graphs(n: usize) -> Vec<Graph> {
-    let mut graphs = vec![];
-    let max_edges = n - 1;
-
-    for num_edges in 0..=max_edges {
-        for edge_set in (0..n).combinations(num_edges) {
-            for targets in (0..n).combinations_with_replacement(num_edges) {
-                let edges: Vec<_> = edge_set
-                    .iter()
-                    .zip(&targets)
-                    .map(|(&from, &to)| (from, to))
-                    .filter(|(from, to)| from != to)
-                    .collect();
-
-                if edges.len() != num_edges {
-                    continue;
-                }
-
-                let mut out_degree = vec![0; n];
-                for &(from, _) in &edges {
-                    out_degree[from] += 1;
-                    if out_degree[from] > 1 {
-                        break;
-                    }
-                }
-                if out_degree.iter().any(|&d| d > 1) {
-                    continue;
-                }
-                if !is_weakly_connected(n, &edges) {
-                    continue;
-                }
-
-                let mut graph = vec![vec![]; n];
-                for (from, to) in edges {
-                    graph[from].push(to);
-                }
-                graphs.push(graph);
-            }
-        }
-    }
-    graphs
-}
-
-fn generate_unsizing_graphs(n: usize) -> Vec<Graph> {
-    let mut graphs = vec![];
-
-    for num_edges in 0..=(n * (n - 1)) {
-        for edges in (0..n)
-            .cartesian_product(0..n)
-            .filter(|(from, to)| from != to)
-            .combinations(num_edges)
-        {
-            let edge_vec: Vec<_> = edges.iter().copied().collect();
-            if !is_weakly_connected(n, &edge_vec) {
-                continue;
-            }
-
-            let mut graph = vec![vec![]; n];
-            for (from, to) in edge_vec {
-                graph[from].push(to);
-            }
-
-            if has_cycle(&graph) {
-                continue;
-            }
-            graphs.push(graph);
-        }
-    }
-    graphs
-}
-
-fn has_cycle(graph: &Graph) -> bool {
-    let n = graph.len();
-    let mut state = vec![0u8; n];
-
-    fn dfs(node: NodeId, graph: &Graph, state: &mut [u8]) -> bool {
-        if state[node] == 1 {
-            return true;
-        }
-        if state[node] == 2 {
-            return false;
-        }
-        state[node] = 1;
-        for &next in &graph[node] {
-            if dfs(next, graph, state) {
-                return true;
-            }
-        }
-        state[node] = 2;
-        false
-    }
-
-    (0..n).any(|i| dfs(i, graph, &mut state))
-}
+use lub_fuzz::*;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Adjustment {
@@ -136,6 +18,7 @@ fn find_lub(
     unsize: &Graph,
 ) -> HashMap<NodeId, (NodeId, Adjustment)> {
     let mut results = HashMap::new();
+    use std::collections::HashSet;
 
     for &node in nodes {
         let mut reachable = HashSet::new();
@@ -166,6 +49,8 @@ fn find_lub(
 }
 
 fn main() {
+    use itertools::Itertools;
+
     for n in 3..=5 {
         println!("Testing with {} nodes", n);
 
@@ -174,21 +59,35 @@ fn main() {
 
         println!("  Deref graphs: {}", deref_graphs.len());
         println!("  Unsize graphs: {}", unsize_graphs.len());
+        println!(
+            "  Total pairs: {}",
+            deref_graphs.len() * unsize_graphs.len()
+        );
 
+        let total = deref_graphs.len() * unsize_graphs.len();
+        let mut count = 0;
         for (di, deref) in deref_graphs.iter().enumerate() {
             for (ui, unsize) in unsize_graphs.iter().enumerate() {
+                count += 1;
+                if count % 10000 == 0 {
+                    println!("  Progress: {}/{}", count, total);
+                }
+
                 let orderings: Vec<Vec<_>> = (0..n).permutations(n).collect();
+                let first = find_lub(&orderings[0], deref, unsize);
 
-                let results: Vec<_> = orderings
+                let mismatch = orderings[1..]
                     .iter()
-                    .map(|ordering| (ordering, find_lub(ordering, deref, unsize)))
-                    .collect();
+                    .any(|ordering| find_lub(ordering, deref, unsize) != first);
 
-                let first_result = &results[0].1;
-                if results.iter().any(|(_, r)| r != first_result) {
+                if mismatch {
                     println!("\n!!! MISMATCH FOUND !!!");
                     println!("Deref graph #{}: {:?}", di, deref);
                     println!("Unsize graph #{}: {:?}", ui, unsize);
+                    let results: Vec<_> = orderings
+                        .iter()
+                        .map(|ordering| (ordering, find_lub(ordering, deref, unsize)))
+                        .collect();
                     for (ordering, result) in results {
                         println!("  Ordering: {:?}", ordering);
                         println!("  Result: {:?}", result);
