@@ -1,8 +1,15 @@
+//! Graph generation and utilities for LUB coercion fuzzing.
+//!
+//! This library provides functions to generate all valid deref and unsizing
+//! coercion graphs with specified constraints.
+
 use itertools::Itertools;
 use std::collections::HashSet;
 
 pub type NodeId = usize;
 
+/// Compressed Sparse Row (CSR) graph representation.
+/// Reduces memory indirection compared to Vec<Vec<NodeId>>.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Graph {
     n: usize,
@@ -11,11 +18,13 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Creates a new empty graph with `n` nodes.
     pub fn new(n: usize) -> Self {
         let data = vec![0; n + 1];
         Self { n, data }
     }
 
+    /// Converts an adjacency list to CSR format.
     pub fn from_adj_list(adj: Vec<Vec<NodeId>>) -> Self {
         let n = adj.len();
         let total_edges: usize = adj.iter().map(|neighbors| neighbors.len()).sum();
@@ -50,16 +59,19 @@ impl Graph {
         &self.data[self.n + 1..]
     }
 
+    /// Returns the neighbors of a node.
     pub fn neighbors(&self, node: NodeId) -> &[NodeId] {
         let start = self.data[node];
         let end = self.data[node + 1];
         &self.data[self.n + 1 + start..self.n + 1 + end]
     }
 
+    /// Returns the number of nodes in the graph.
     pub fn len(&self) -> usize {
         self.n
     }
 
+    /// Adds an edge from `from` to `to`.
     pub fn push_edge(&mut self, from: NodeId, to: NodeId) {
         let insert_pos = self.n + 1 + self.data[from + 1];
         self.data.insert(insert_pos, to);
@@ -68,6 +80,7 @@ impl Graph {
         }
     }
 
+    /// Removes the last edge added from `from`.
     pub fn pop_edge(&mut self, from: NodeId) {
         if self.data[from + 1] > self.data[from] {
             let remove_pos = self.n + 1 + self.data[from + 1] - 1;
@@ -79,6 +92,7 @@ impl Graph {
     }
 }
 
+/// Checks if a graph is weakly connected (connected when treating edges as undirected).
 pub fn is_weakly_connected(n: usize, edges: &[(NodeId, NodeId)]) -> bool {
     if n == 0 {
         return true;
@@ -102,6 +116,12 @@ pub fn is_weakly_connected(n: usize, edges: &[(NodeId, NodeId)]) -> bool {
     visited.iter().all(|&v| v)
 }
 
+/// Generates all valid deref coercion graphs.
+///
+/// Constraints:
+/// - Each node has at most one outgoing deref edge
+/// - Graph is weakly connected
+/// - No self-loops
 pub fn generate_deref_graphs(n: usize) -> Vec<Graph> {
     let mut graphs = vec![];
     let max_edges = n - 1;
@@ -145,6 +165,12 @@ pub fn generate_deref_graphs(n: usize) -> Vec<Graph> {
     graphs
 }
 
+/// Generates all valid unsizing coercion graphs.
+///
+/// Constraints:
+/// - Graph is a DAG (no cycles)
+/// - Graph is weakly connected
+/// - No self-loops
 pub fn generate_unsizing_graphs(n: usize) -> Vec<Graph> {
     let mut graphs = HashSet::new();
     let all_edges: Vec<_> = (0..n)
@@ -183,6 +209,7 @@ pub fn generate_unsizing_graphs(n: usize) -> Vec<Graph> {
     graphs.into_iter().collect()
 }
 
+/// Detects if a directed graph contains a cycle.
 pub fn has_cycle(graph: &Graph) -> bool {
     let n = graph.len();
     let mut state = vec![0u8; n];
