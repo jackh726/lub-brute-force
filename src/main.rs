@@ -1,5 +1,9 @@
 use lub_fuzz::*;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufWriter, Write},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Adjustment {
@@ -29,12 +33,12 @@ fn find_lub(
                 continue;
             }
 
-            for &next in &deref[current] {
+            for &next in deref.neighbors(current) {
                 let mut new_path = path.clone();
                 new_path.push((current, EdgeType::Deref));
                 queue.push((next, new_path));
             }
-            for &next in &unsize[current] {
+            for &next in unsize.neighbors(current) {
                 let mut new_path = path.clone();
                 new_path.push((current, EdgeType::Unsize));
                 queue.push((next, new_path));
@@ -48,10 +52,21 @@ fn find_lub(
     results
 }
 
-fn main() {
+fn write_graphs(file: &str, graphs: &[Graph]) -> anyhow::Result<()> {
+    let file = File::create(file)?;
+    let mut file = BufWriter::new(file);
+    for (i, graph) in graphs.iter().enumerate() {
+        writeln!(file, "{i}: {:?}", graph.to_adj_list())?;
+    }
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
     use itertools::Itertools;
 
     for n in 3..=5 {
+        let file = File::create(&format!("target/{n}-lubs.txt"))?;
+        let mut file = BufWriter::new(file);
         println!("Testing with {} nodes", n);
 
         let deref_graphs = generate_deref_graphs(n);
@@ -64,6 +79,9 @@ fn main() {
             deref_graphs.len() * unsize_graphs.len()
         );
 
+        write_graphs(&format!("target/{n}-deref.txt"), &deref_graphs)?;
+        write_graphs(&format!("target/{n}-unsize.txt"), &unsize_graphs)?;
+
         let total = deref_graphs.len() * unsize_graphs.len();
         let mut count = 0;
         for (di, deref) in deref_graphs.iter().enumerate() {
@@ -75,6 +93,7 @@ fn main() {
 
                 let orderings: Vec<Vec<_>> = (0..n).permutations(n).collect();
                 let first = find_lub(&orderings[0], deref, unsize);
+                writeln!(file, "{di}-{ui}: {:?}", first)?;
 
                 let mismatch = orderings[1..]
                     .iter()
@@ -96,4 +115,5 @@ fn main() {
             }
         }
     }
+    Ok(())
 }

@@ -2,9 +2,87 @@ use itertools::Itertools;
 use std::collections::HashSet;
 
 pub type NodeId = usize;
-pub type Graph = Vec<Vec<NodeId>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Graph {
+    n: usize,
+    // Layout: [offset_0, offset_1, ..., offset_n, edge_0, edge_1, ..., edge_m]
+    data: Vec<usize>,
+}
+
+impl Graph {
+    pub fn new(n: usize) -> Self {
+        let data = vec![0; n + 1];
+        Self { n, data }
+    }
+
+    pub fn from_adj_list(adj: Vec<Vec<NodeId>>) -> Self {
+        let n = adj.len();
+        let total_edges: usize = adj.iter().map(|neighbors| neighbors.len()).sum();
+
+        let mut data = Vec::with_capacity(n + 1 + total_edges);
+        data.push(0);
+
+        let mut edge_count = 0;
+        for neighbors in &adj {
+            edge_count += neighbors.len();
+            data.push(edge_count);
+        }
+
+        for neighbors in adj {
+            data.extend(neighbors);
+        }
+
+        Self { n, data }
+    }
+
+    pub fn to_adj_list(&self) -> Vec<Vec<NodeId>> {
+        (0..self.n)
+            .map(|node| self.neighbors(node).to_vec())
+            .collect()
+    }
+
+    pub fn offsets(&self) -> &[usize] {
+        &self.data[..=self.n]
+    }
+
+    pub fn edges(&self) -> &[NodeId] {
+        &self.data[self.n + 1..]
+    }
+
+    pub fn neighbors(&self, node: NodeId) -> &[NodeId] {
+        let start = self.data[node];
+        let end = self.data[node + 1];
+        &self.data[self.n + 1 + start..self.n + 1 + end]
+    }
+
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn push_edge(&mut self, from: NodeId, to: NodeId) {
+        let insert_pos = self.n + 1 + self.data[from + 1];
+        self.data.insert(insert_pos, to);
+        for i in (from + 1)..=self.n {
+            self.data[i] += 1;
+        }
+    }
+
+    pub fn pop_edge(&mut self, from: NodeId) {
+        if self.data[from + 1] > self.data[from] {
+            let remove_pos = self.n + 1 + self.data[from + 1] - 1;
+            self.data.remove(remove_pos);
+            for i in (from + 1)..=self.n {
+                self.data[i] -= 1;
+            }
+        }
+    }
+}
 
 pub fn is_weakly_connected(n: usize, edges: &[(NodeId, NodeId)]) -> bool {
+    if n == 0 {
+        return true;
+    }
     let mut adj = vec![vec![]; n];
     for &(from, to) in edges {
         adj[from].push(to);
@@ -60,7 +138,7 @@ pub fn generate_deref_graphs(n: usize) -> Vec<Graph> {
                 for (from, to) in edges {
                     graph[from].push(to);
                 }
-                graphs.push(graph);
+                graphs.push(Graph::from_adj_list(graph));
             }
         }
     }
@@ -83,7 +161,7 @@ pub fn generate_unsizing_graphs(n: usize) -> Vec<Graph> {
     ) {
         if !has_cycle(graph) {
             let edge_list: Vec<_> = (0..n)
-                .flat_map(|i| graph[i].iter().map(move |&j| (i, j)))
+                .flat_map(|i| graph.neighbors(i).iter().map(move |&j| (i, j)))
                 .collect();
             if is_weakly_connected(n, &edge_list) {
                 graphs.insert(graph.clone());
@@ -94,13 +172,13 @@ pub fn generate_unsizing_graphs(n: usize) -> Vec<Graph> {
 
         for i in idx..edges.len() {
             let (from, to) = edges[i];
-            graph[from].push(to);
+            graph.push_edge(from, to);
             backtrack(i + 1, edges, graph, graphs, n);
-            graph[from].pop();
+            graph.pop_edge(from);
         }
     }
 
-    let mut graph = vec![vec![]; n];
+    let mut graph = Graph::new(n);
     backtrack(0, &all_edges, &mut graph, &mut graphs, n);
     graphs.into_iter().collect()
 }
@@ -117,7 +195,7 @@ pub fn has_cycle(graph: &Graph) -> bool {
             return false;
         }
         state[node] = 1;
-        for &next in &graph[node] {
+        for &next in graph.neighbors(node) {
             if dfs(next, graph, state) {
                 return true;
             }
@@ -138,9 +216,9 @@ mod tests {
         for n in 2..=4 {
             let graphs = generate_deref_graphs(n);
             for graph in &graphs {
-                for node_edges in graph {
+                for node in 0..graph.len() {
                     assert!(
-                        node_edges.len() <= 1,
+                        graph.neighbors(node).len() <= 1,
                         "Node has multiple outgoing deref edges"
                     );
                 }
@@ -154,7 +232,7 @@ mod tests {
             let graphs = generate_deref_graphs(n);
             for graph in &graphs {
                 let edges: Vec<_> = (0..n)
-                    .flat_map(|i| graph[i].iter().map(move |&j| (i, j)))
+                    .flat_map(|i| graph.neighbors(i).iter().map(move |&j| (i, j)))
                     .collect();
                 assert!(
                     is_weakly_connected(n, &edges),
@@ -169,8 +247,11 @@ mod tests {
         for n in 2..=4 {
             let graphs = generate_deref_graphs(n);
             for graph in &graphs {
-                for (i, edges) in graph.iter().enumerate() {
-                    assert!(!edges.contains(&i), "Self-loop found in deref graph");
+                for i in 0..graph.len() {
+                    assert!(
+                        !graph.neighbors(i).contains(&i),
+                        "Self-loop found in deref graph"
+                    );
                 }
             }
         }
@@ -192,7 +273,7 @@ mod tests {
             let graphs = generate_unsizing_graphs(n);
             for graph in &graphs {
                 let edges: Vec<_> = (0..n)
-                    .flat_map(|i| graph[i].iter().map(move |&j| (i, j)))
+                    .flat_map(|i| graph.neighbors(i).iter().map(move |&j| (i, j)))
                     .collect();
                 assert!(
                     is_weakly_connected(n, &edges),
@@ -207,8 +288,11 @@ mod tests {
         for n in 2..=3 {
             let graphs = generate_unsizing_graphs(n);
             for graph in &graphs {
-                for (i, edges) in graph.iter().enumerate() {
-                    assert!(!edges.contains(&i), "Self-loop found in unsizing graph");
+                for i in 0..graph.len() {
+                    assert!(
+                        !graph.neighbors(i).contains(&i),
+                        "Self-loop found in unsizing graph"
+                    );
                 }
             }
         }
@@ -226,13 +310,13 @@ mod tests {
 
     #[test]
     fn test_cycle_detection() {
-        let no_cycle = vec![vec![1], vec![2], vec![]];
+        let no_cycle = Graph::from_adj_list(vec![vec![1], vec![2], vec![]]);
         assert!(!has_cycle(&no_cycle));
 
-        let with_cycle = vec![vec![1], vec![2], vec![0]];
+        let with_cycle = Graph::from_adj_list(vec![vec![1], vec![2], vec![0]]);
         assert!(has_cycle(&with_cycle));
 
-        let self_loop = vec![vec![0]];
+        let self_loop = Graph::from_adj_list(vec![vec![0]]);
         assert!(has_cycle(&self_loop));
     }
 }
