@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.100"
 itertools = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-tree = "0.4"

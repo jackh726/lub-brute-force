@@ -51,14 +51,6 @@ impl Graph {
             .collect()
     }
 
-    pub fn offsets(&self) -> &[usize] {
-        &self.data[..=self.n]
-    }
-
-    pub fn edges(&self) -> &[NodeId] {
-        &self.data[self.n + 1..]
-    }
-
     /// Returns the neighbors of a node.
     pub fn neighbors(&self, node: NodeId) -> &[NodeId] {
         let start = self.data[node];
