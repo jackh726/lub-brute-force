@@ -81,10 +81,10 @@ fn find_lub_simple(
     Some((common_lub?, adjustments_by_node))
 }
 
-#[derive(Copy, Clone, Debug)]
-enum FindLubVersion {
-    Main,
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum AlgoChanges {
     NoMutualCoercion,
+    RequireDirect,
 }
 
 /// Finds the LUB type and adjustment paths for each node.
@@ -98,7 +98,7 @@ fn find_lub(
     nodes: &[NodeId],
     deref: &Graph,
     unsize: &Graph,
-    version: FindLubVersion,
+    changes: &[AlgoChanges],
 ) -> Option<(NodeId, Vec<Adjustment>)> {
     tracing::debug!(deref = ?deref.to_adj_list(), unsize = ?unsize.to_adj_list());
     let mut lub = nodes[0];
@@ -135,9 +135,9 @@ fn find_lub(
             None
         };
         tracing::debug!("Deref chain from node to LUB: {deref_found:?}");
-        if let FindLubVersion::NoMutualCoercion = version
-            && unsize_found
+        if unsize_found
             && let Some(_) = &deref_found
+            && changes.contains(&AlgoChanges::NoMutualCoercion)
         {
             tracing::debug!("mutual coercion found -> bailing");
             return None;
@@ -172,9 +172,9 @@ fn find_lub(
             None
         };
         tracing::debug!("Deref chain found from LUB to to node: {deref_found:?}");
-        if let FindLubVersion::NoMutualCoercion = version
-            && unsize_found
+        if unsize_found
             && let Some(_) = &deref_found
+            && changes.contains(&AlgoChanges::NoMutualCoercion)
         {
             tracing::debug!("mutual coercion found -> bailing");
             return None;
@@ -219,18 +219,18 @@ fn do_find_inner(
     deref: &Graph,
     ui: usize,
     unsize: &Graph,
-    version: FindLubVersion,
+    changes: &[AlgoChanges],
 ) -> anyhow::Result<Option<(usize, Vec<Adjustment>)>> {
     use itertools::Itertools;
 
     let orderings: Vec<Vec<_>> = (0..n).permutations(n).collect();
 
-    let first = find_lub(&orderings[0], deref, unsize, version);
+    let first = find_lub(&orderings[0], deref, unsize, changes);
     writeln!(file, "d{di}-u{ui}")?;
     writeln!(file, "  {:?}: {first:?}", orderings[0])?;
 
     for order in orderings.iter().skip(1) {
-        let new_lub = find_lub(&order, deref, unsize, version);
+        let new_lub = find_lub(&order, deref, unsize, changes);
         writeln!(file, "  {order:?}: {new_lub:?}")?;
         if new_lub != first {
             let mut mismatch_string = "\n".to_string();
@@ -290,8 +290,7 @@ fn main() -> anyhow::Result<()> {
                     println!("  Progress: {}/{}", count, total);
                 }
 
-                let res_main =
-                    do_find_inner(&mut file, n, di, deref, ui, unsize, FindLubVersion::Main);
+                let res_main = do_find_inner(&mut file, n, di, deref, ui, unsize, &[]);
                 let res_no_mut = do_find_inner(
                     &mut file,
                     n,
@@ -299,7 +298,7 @@ fn main() -> anyhow::Result<()> {
                     deref,
                     ui,
                     unsize,
-                    FindLubVersion::NoMutualCoercion,
+                    &[AlgoChanges::NoMutualCoercion],
                 );
                 match (&res_main, &res_no_mut) {
                     (Ok(_), Ok(_)) => {}
@@ -319,7 +318,6 @@ fn main() -> anyhow::Result<()> {
         }
         if any_errors {
             break;
-            carg
         }
     }
     Ok(())
