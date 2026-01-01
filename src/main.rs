@@ -6,7 +6,7 @@
 use lub_fuzz::*;
 use std::{
     collections::HashMap,
-    fmt::Write as _,
+    fmt::{Debug, Write as _},
     fs::File,
     io::{BufWriter, Write},
 };
@@ -229,6 +229,59 @@ fn write_graphs(file: &str, graphs: &[Graph]) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
+fn error_string(error: &Error, di: usize, deref: &Graph, ui: usize, unsize: &Graph) -> String {
+    let mut mismatch_string = "\n".to_string();
+    writeln!(mismatch_string, "!!! MISMATCH FOUND ({:?}) !!!", error.kind).unwrap();
+    writeln!(
+        mismatch_string,
+        "Deref graph #{}: {:?}",
+        di,
+        deref.to_adj_list()
+    )
+    .unwrap();
+    writeln!(
+        mismatch_string,
+        "Unsize graph #{}: {:?}",
+        ui,
+        unsize.to_adj_list()
+    )
+    .unwrap();
+    let Error {
+        first_order,
+        second_order,
+        first_result,
+        second_result,
+        ..
+    } = error;
+    writeln!(mismatch_string, "  {first_order:?}: {first_result:?}").unwrap();
+    writeln!(mismatch_string, "  {second_order:?}: {second_result:?}").unwrap();
+
+    mismatch_string
+}
+
+fn print_map<K: Debug, V: Debug>(map: &HashMap<K, V>) -> String {
+    let mut ret = String::new();
+    for (k, v) in map.iter() {
+        ret.push_str(&format!("  {k:?}: {v:?}\n"));
+    }
+    ret
+}
+
+#[derive(Clone, Debug)]
+struct Error {
+    kind: ErrorKind,
+    first_order: Vec<NodeId>,
+    second_order: Vec<NodeId>,
+    first_result: Option<(usize, Vec<Adjustment>)>,
+    second_result: Option<(usize, Vec<Adjustment>)>,
+}
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum ErrorKind {
+    DifferentLUB,
+    DifferentAdjustments(NodeId),
+}
+
 fn do_find_inner(
     file: &mut BufWriter<File>,
     n: usize,
@@ -237,36 +290,33 @@ fn do_find_inner(
     ui: usize,
     unsize: &Graph,
     changes: &[AlgoChanges],
-) -> anyhow::Result<Option<(usize, Vec<Adjustment>)>> {
+) -> Result<Option<(usize, Vec<Adjustment>)>, Box<Error>> {
     use itertools::Itertools;
 
     let orderings: Vec<Vec<_>> = (0..n).permutations(n).collect();
 
     let first = find_lub(&orderings[0], deref, unsize, changes);
-    writeln!(file, "d{di}-u{ui}")?;
-    writeln!(file, "  {:?}: {first:?}", orderings[0])?;
+    writeln!(file, "d{di}-u{ui}").unwrap();
+    writeln!(file, "  {:?}: {first:?}", orderings[0]).unwrap();
 
     for order in orderings.iter().skip(1) {
         let new_lub = find_lub(&order, deref, unsize, changes);
-        writeln!(file, "  {order:?}: {new_lub:?}")?;
-        if new_lub != first {
-            let mut mismatch_string = "\n".to_string();
-            writeln!(mismatch_string, "!!! MISMATCH FOUND !!!")?;
-            writeln!(
-                mismatch_string,
-                "Deref graph #{}: {:?}",
-                di,
-                deref.to_adj_list()
-            )?;
-            writeln!(
-                mismatch_string,
-                "Unsize graph #{}: {:?}",
-                ui,
-                unsize.to_adj_list()
-            )?;
-            writeln!(mismatch_string, "  {:?}: {first:?}", &orderings[0])?;
-            writeln!(mismatch_string, "  {:?}: {new_lub:?}", &order)?;
-            anyhow::bail!(mismatch_string);
+        writeln!(file, "  {order:?}: {new_lub:?}").unwrap();
+        if first != new_lub {
+            let kind = match (&first, &new_lub) {
+                (Some(first), Some(second)) if first.0 != second.0 => ErrorKind::DifferentLUB,
+
+                (None, Some(_)) | (Some(_), None) => ErrorKind::DifferentLUB,
+                (Some(first), Some(_)) => ErrorKind::DifferentAdjustments(first.0),
+                (None, None) => unreachable!(),
+            };
+            return Err(Box::new(Error {
+                kind,
+                first_order: orderings[0].clone(),
+                second_order: order.clone(),
+                first_result: first,
+                second_result: new_lub,
+            }));
         }
     }
 
@@ -275,12 +325,6 @@ fn do_find_inner(
 
 #[derive(Default, Debug)]
 struct Stats {
-    ok_some_to_ok_none: usize,
-    both_ok: usize,
-    both_err: usize,
-    main_ok_no_mut_err: usize,
-    main_err_no_mut_ok_none: usize,
-    main_err_no_mut_ok_some: usize,
     no_mut_ok: usize,
     no_mut_err: usize,
 }
@@ -312,6 +356,7 @@ fn main() -> anyhow::Result<()> {
         let total = deref_graphs.len() * unsize_graphs.len();
         let mut count = 0;
         let mut stats = Stats::default();
+        let mut paired_stats: HashMap<_, usize> = HashMap::new();
         for (di, deref) in deref_graphs.iter().enumerate() {
             for (ui, unsize) in unsize_graphs.iter().enumerate() {
                 count += 1;
@@ -330,23 +375,45 @@ fn main() -> anyhow::Result<()> {
                     &[AlgoChanges::NoMutualCoercion, AlgoChanges::RequireDirect],
                 );
                 match (&res_main, &res_no_mut) {
-                    (Ok(Some(_)), Ok(None)) => {
-                        stats.ok_some_to_ok_none += 1;
+                    (Ok(Some(v)), Ok(None)) => {
+                        *paired_stats.entry((Ok(Some(v.0)), Ok(None))).or_default() += 1;
                         //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
                     }
-                    (Ok(_), Ok(_)) => stats.both_ok += 1,
-                    (Err(_), Err(_)) => stats.both_err += 1,
-                    (Ok(_), Err(_)) => {
-                        stats.main_ok_no_mut_err += 1;
-                        //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
+                    (Ok(None), Ok(Some(v))) => {
+                        *paired_stats.entry((Ok(None), Ok(Some(v.0)))).or_default() += 1;
                     }
-                    (Err(_), Ok(None)) => {
-                        stats.main_err_no_mut_ok_none += 1;
-                        //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
+                    (Ok(Some(v1)), Ok(Some(v2))) => {
+                        *paired_stats
+                            .entry((Ok(Some(v1.0)), Ok(Some(v2.0))))
+                            .or_default() += 1;
                     }
-                    (Err(_), Ok(Some(_))) => {
-                        stats.main_err_no_mut_ok_some += 1;
-                        tracing::info!(?res_main, ?res_no_mut, "change in behavior");
+                    (Ok(None), Ok(None)) => {
+                        *paired_stats.entry((Ok(None), Ok(None))).or_default() += 1;
+                    }
+                    (Err(e1), Err(e2)) => {
+                        *paired_stats
+                            .entry((Err(e1.kind), Err(e2.kind)))
+                            .or_default() += 1;
+                    }
+                    (Ok(Some(v)), Err(e)) => {
+                        *paired_stats
+                            .entry((Ok(Some(v.0)), Err(e.kind)))
+                            .or_default() += 1;
+                        //tracing::info!(?res_main, change_error = error_string(&**e, di, deref, ui, unsize), "change in behavior");
+                    }
+                    (Ok(None), Err(e)) => {
+                        *paired_stats.entry((Ok(None), Err(e.kind))).or_default() += 1;
+                        //tracing::info!(?res_main, change_error = error_string(&**e, di, deref, ui, unsize), "change in behavior");
+                    }
+                    (Err(e), Ok(None)) => {
+                        *paired_stats.entry((Err(e.kind), Ok(None))).or_default() += 1;
+                        //tracing::info!(main_error = error_string(&**e, di, deref, ui, unsize), ?res_no_mut, "change in behavior");
+                    }
+                    (Err(e), Ok(Some(v))) => {
+                        *paired_stats
+                            .entry((Err(e.kind), Ok(Some(v.0))))
+                            .or_default() += 1;
+                        //tracing::info!(main_error = display(error_string(&**e, di, deref, ui, unsize)), ?res_no_mut, "change in behavior");
                     }
                 }
                 match &res_no_mut {
@@ -361,6 +428,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         println!("Algorithm comparison stats: {:#?}", stats);
+        println!("Algorithm comparison stats:\n{}", print_map(&paired_stats));
     }
     Ok(())
 }
