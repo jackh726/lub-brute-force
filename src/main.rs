@@ -77,8 +77,12 @@ fn find_lub_simple(
     Some((common_lub?, adjustments_by_node))
 }
 
-fn does_unsize(from: NodeId, to: NodeId, unsize: &Graph) -> bool {
-    unsize.neighbors(from).iter().any(|u| *u == to)
+fn does_unsize(from: NodeId, to: NodeId, unsize: &Graph) -> Option<Vec<(usize, EdgeType)>> {
+    unsize
+        .neighbors(from)
+        .iter()
+        .any(|u| *u == to)
+        .then(|| vec![(to, EdgeType::Unsize)])
 }
 
 fn does_deref(from: NodeId, to: NodeId, deref: &Graph) -> Option<Vec<(usize, EdgeType)>> {
@@ -95,6 +99,15 @@ fn does_deref(from: NodeId, to: NodeId, deref: &Graph) -> Option<Vec<(usize, Edg
         }
     }
     None
+}
+
+fn does_coerce(
+    from: NodeId,
+    to: NodeId,
+    unsize: &Graph,
+    deref: &Graph,
+) -> Option<Vec<(usize, EdgeType)>> {
+    does_unsize(from, to, unsize).or_else(|| does_deref(from, to, deref))
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -131,78 +144,47 @@ fn find_lub(
         }
 
         // First check if there exists a coercion to the LUB
-        let unsize_to_lub = does_unsize(node, lub, unsize);
-        let deref_to_lub = does_deref(node, lub, deref);
-
+        let coerce_to_lub = does_coerce(node, lub, unsize, deref);
         // Then check if there exists a coercion from the current LUB to the new node
-        let unsize_to_new = does_unsize(lub, node, unsize);
-        let deref_to_new = does_deref(lub, node, deref);
+        let coerce_to_new = does_coerce(lub, node, unsize, deref);
 
-        tracing::debug!(?unsize_to_lub, ?deref_to_lub, ?unsize_to_new, ?deref_to_new);
+        tracing::debug!(?coerce_to_lub, ?coerce_to_new);
 
-        if (unsize_to_lub || deref_to_lub.is_some())
-            && (unsize_to_new || deref_to_new.is_some())
+        if coerce_to_lub.is_some()
+            && coerce_to_new.is_some()
             && changes.contains(&AlgoChanges::NoMutualCoercion)
         {
             tracing::debug!("mutual coercion found -> bailing");
             return None;
         }
 
-        if unsize_to_lub {
-            adjustments_by_node[node].push((lub, EdgeType::Unsize));
-            continue;
-        }
-        if let Some(deref_found) = deref_to_lub {
-            adjustments_by_node[node].extend(deref_found);
+        if let Some(coerce) = coerce_to_lub {
+            adjustments_by_node[node].extend(coerce);
             continue;
         }
 
-        if unsize_to_new {
-            for j in nodes[0..i].iter().copied() {
-                adjustments_by_node[j].push((node, EdgeType::Unsize));
-            }
-            if !changes.contains(&AlgoChanges::RequireDirect) {
+        if !changes.contains(&AlgoChanges::RequireDirect) {
+            if let Some(coerce) = coerce_to_new {
                 for j in nodes[0..i].iter().copied() {
-                    adjustments_by_node[j].push((node, EdgeType::Unsize));
+                    adjustments_by_node[j].extend(coerce.iter().copied());
                 }
-            } else {
+                lub = node;
+                continue;
+            }
+        } else {
+            if let Some(_) = coerce_to_new {
                 for j in nodes[0..i].iter().copied() {
-                    let unsize_direct = does_unsize(j, node, unsize);
-                    let deref_direct = does_deref(j, node, deref);
-                    if unsize_direct {
-                        adjustments_by_node[j] = vec![(node, EdgeType::Unsize)];
-                    } else if let Some(deref_direct) = deref_direct {
-                        adjustments_by_node[j] = deref_direct;
+                    let coerce_direct = does_coerce(j, node, unsize, deref);
+                    if let Some(coerce_direct) = coerce_direct {
+                        adjustments_by_node[j] = coerce_direct;
                     } else {
                         tracing::debug!(?j, ?node, "no direct coercion available");
                         return None;
                     }
                 }
+                lub = node;
+                continue;
             }
-            lub = node;
-            continue;
-        }
-        if let Some(deref_found) = deref_to_new {
-            if !changes.contains(&AlgoChanges::RequireDirect) {
-                for j in nodes[0..i].iter().copied() {
-                    adjustments_by_node[j].extend(deref_found.iter().copied());
-                }
-            } else {
-                for j in nodes[0..i].iter().copied() {
-                    let unsize_direct = does_unsize(j, node, unsize);
-                    let deref_direct = does_deref(j, node, deref);
-                    if unsize_direct {
-                        adjustments_by_node[j] = vec![(node, EdgeType::Unsize)];
-                    } else if let Some(deref_direct) = deref_direct {
-                        adjustments_by_node[j] = deref_direct;
-                    } else {
-                        tracing::debug!(?j, ?node, "no direct coercion available");
-                        return None;
-                    }
-                }
-            }
-            lub = node;
-            continue;
         }
 
         return None;
