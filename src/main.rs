@@ -252,7 +252,8 @@ struct Error {
 }
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum ErrorKind {
-    DifferentLUB,
+    TwoDifferentLUBs,
+    MissingLUB,
     DifferentAdjustments(NodeId),
 }
 
@@ -281,9 +282,9 @@ fn do_find_inner(
         }
         if first != new_lub {
             let kind = match (&first, &new_lub) {
-                (Some(first), Some(second)) if first.0 != second.0 => ErrorKind::DifferentLUB,
+                (Some(first), Some(second)) if first.0 != second.0 => ErrorKind::TwoDifferentLUBs,
 
-                (None, Some(_)) | (Some(_), None) => ErrorKind::DifferentLUB,
+                (None, Some(_)) | (Some(_), None) => ErrorKind::MissingLUB,
                 (Some(first), Some(_)) => ErrorKind::DifferentAdjustments(first.0),
                 (None, None) => unreachable!(),
             };
