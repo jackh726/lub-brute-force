@@ -81,9 +81,30 @@ fn find_lub_simple(
     Some((common_lub?, adjustments_by_node))
 }
 
+fn does_unsize(from: NodeId, to: NodeId, unsize: &Graph) -> bool {
+    unsize.neighbors(from).iter().any(|u| *u == to)
+}
+
+fn does_deref(from: NodeId, to: NodeId, deref: &Graph) -> Option<Vec<(usize, EdgeType)>> {
+    let mut current_node = from;
+    let mut deref_adjs = Vec::with_capacity(deref.len());
+    while let Some(deref_target) = deref.neighbors(current_node).first() {
+        current_node = *deref_target;
+        deref_adjs.push((current_node, EdgeType::Deref));
+        if current_node == to {
+            return Some(deref_adjs);
+        }
+        if current_node == from {
+            unreachable!("Deref cycle found - though should be unreachable by construction.");
+        }
+    }
+    None
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum AlgoChanges {
     NoMutualCoercion,
+    RequireDirect,
 }
 
 /// Finds the LUB type and adjustment paths for each node.
@@ -114,48 +135,16 @@ fn find_lub(
         }
 
         // First check if there exists a coercion to the LUB
-        let unsize_to_lub = unsize.neighbors(node).iter().any(|u| *u == lub);
+        let unsize_to_lub = does_unsize(node, lub, unsize);
         tracing::debug!("Unsize found from node to LUB: {unsize_to_lub}");
-        let deref_to_lub = 'deref_found: {
-            let mut current_node = node;
-            let mut deref_adjs = Vec::with_capacity(nodes.len());
-            while let Some(deref_target) = deref.neighbors(current_node).first() {
-                current_node = *deref_target;
-                deref_adjs.push((current_node, EdgeType::Deref));
-                if current_node == lub {
-                    break 'deref_found Some(deref_adjs);
-                }
-                if current_node == node {
-                    unreachable!(
-                        "Deref cycle found - though should be unreachable by construction."
-                    );
-                }
-            }
-            None
-        };
+        let deref_to_lub = does_deref(node, lub, deref);
         tracing::debug!("Deref chain from node to LUB: {deref_to_lub:?}");
 
         // Then check if there exists a coercion from the current LUB to the new node
-        let unsize_to_new = unsize.neighbors(lub).iter().any(|u| *u == node);
-        tracing::debug!("Unsize found from LUB to to node: {unsize_to_new}");
-        let deref_to_new = 'deref_found: {
-            let mut current_node = lub;
-            let mut deref_adjs = Vec::with_capacity(nodes.len());
-            while let Some(deref_target) = deref.neighbors(current_node).first() {
-                current_node = *deref_target;
-                deref_adjs.push((current_node, EdgeType::Deref));
-                if current_node == node {
-                    break 'deref_found Some(deref_adjs);
-                }
-                if current_node == lub {
-                    unreachable!(
-                        "Deref cycle found - though should be unreachable by construction."
-                    );
-                }
-            }
-            None
-        };
-        tracing::debug!("Deref chain found from LUB to to node: {deref_to_new:?}");
+        let unsize_to_new = does_unsize(lub, node, unsize);
+        tracing::debug!("Unsize found from LUB to new node: {unsize_to_new}");
+        let deref_to_new = does_deref(lub, node, deref);
+        tracing::debug!("Deref chain found from LUB to new node: {deref_to_new:?}");
 
         if (unsize_to_lub || deref_to_lub.is_some())
             && (unsize_to_new || deref_to_new.is_some())
@@ -178,14 +167,47 @@ fn find_lub(
             for j in nodes[0..i].iter().copied() {
                 adjustments_by_node[j].path.push((node, EdgeType::Unsize));
             }
+            if !changes.contains(&AlgoChanges::RequireDirect) {
+                for j in nodes[0..i].iter().copied() {
+                    adjustments_by_node[j].path.push((node, EdgeType::Unsize));
+                }
+            } else {
+                for j in nodes[0..i].iter().copied() {
+                    let unsize_direct = does_unsize(j, node, unsize);
+                    let deref_direct = does_deref(j, node, deref);
+                    if unsize_direct {
+                        adjustments_by_node[j].path = vec![(node, EdgeType::Unsize)];
+                    } else if let Some(deref_direct) = deref_direct {
+                        adjustments_by_node[j].path = deref_direct;
+                    } else {
+                        tracing::debug!(?j, ?node, "no direct coercion available");
+                        return None;
+                    }
+                }
+            }
             lub = node;
             continue;
         }
         if let Some(deref_found) = deref_to_new {
-            for j in nodes[0..i].iter().copied() {
-                adjustments_by_node[j]
-                    .path
-                    .extend(deref_found.iter().copied());
+            if !changes.contains(&AlgoChanges::RequireDirect) {
+                for j in nodes[0..i].iter().copied() {
+                    adjustments_by_node[j]
+                        .path
+                        .extend(deref_found.iter().copied());
+                }
+            } else {
+                for j in nodes[0..i].iter().copied() {
+                    let unsize_direct = does_unsize(j, node, unsize);
+                    let deref_direct = does_deref(j, node, deref);
+                    if unsize_direct {
+                        adjustments_by_node[j].path = vec![(node, EdgeType::Unsize)];
+                    } else if let Some(deref_direct) = deref_direct {
+                        adjustments_by_node[j].path = deref_direct;
+                    } else {
+                        tracing::debug!(?j, ?node, "no direct coercion available");
+                        return None;
+                    }
+                }
             }
             lub = node;
             continue;
@@ -305,7 +327,7 @@ fn main() -> anyhow::Result<()> {
                     deref,
                     ui,
                     unsize,
-                    &[AlgoChanges::NoMutualCoercion],
+                    &[AlgoChanges::NoMutualCoercion, AlgoChanges::RequireDirect],
                 );
                 match (&res_main, &res_no_mut) {
                     (Ok(Some(_)), Ok(None)) => {
@@ -324,7 +346,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     (Err(_), Ok(Some(_))) => {
                         stats.main_err_no_mut_ok_some += 1;
-                        //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
+                        tracing::info!(?res_main, ?res_no_mut, "change in behavior");
                     }
                 }
                 match &res_no_mut {
@@ -338,7 +360,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        tracing::info!("Algorithm comparison stats: {:#?}", stats);
+        println!("Algorithm comparison stats: {:#?}", stats);
     }
     Ok(())
 }
