@@ -6,6 +6,7 @@
 use lub_fuzz::*;
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     fs::File,
     io::{BufWriter, Write},
 };
@@ -80,14 +81,25 @@ fn find_lub_simple(
     Some((common_lub?, adjustments_by_node))
 }
 
+#[derive(Copy, Clone, Debug)]
+enum FindLubVersion {
+    Main,
+    NoMutualCoercion,
+}
+
 /// Finds the LUB type and adjustment paths for each node.
 ///
 /// Returns `Some((lub, adjustments))` if a common LUB exists for all nodes,
 /// where `adjustments[node_id]` is the path from that node to the LUB.
 /// Each step in the path is (next_node, edge_type) to reach that node.
 /// Returns `None` if no common LUB can be found.
-#[tracing::instrument(skip(deref, unsize), ret)]
-fn find_lub(nodes: &[NodeId], deref: &Graph, unsize: &Graph) -> Option<(NodeId, Vec<Adjustment>)> {
+#[tracing::instrument(level = "debug", skip(deref, unsize), ret)]
+fn find_lub(
+    nodes: &[NodeId],
+    deref: &Graph,
+    unsize: &Graph,
+    version: FindLubVersion,
+) -> Option<(NodeId, Vec<Adjustment>)> {
     tracing::debug!(deref = ?deref.to_adj_list(), unsize = ?unsize.to_adj_list());
     let mut lub = nodes[0];
     let mut adjustments_by_node = vec![Adjustment { path: vec![] }; nodes.len()];
@@ -105,10 +117,6 @@ fn find_lub(nodes: &[NodeId], deref: &Graph, unsize: &Graph) -> Option<(NodeId, 
         // First check if there exists a coercion to the LUB
         let unsize_found = unsize.neighbors(node).iter().any(|u| *u == lub);
         tracing::debug!("Unsize found from node to LUB: {unsize_found}");
-        if unsize_found {
-            adjustments_by_node[node].path.push((lub, EdgeType::Unsize));
-            continue;
-        }
         let deref_found = 'deref_found: {
             let mut current_node = node;
             let mut deref_adjs = Vec::with_capacity(nodes.len());
@@ -127,6 +135,17 @@ fn find_lub(nodes: &[NodeId], deref: &Graph, unsize: &Graph) -> Option<(NodeId, 
             None
         };
         tracing::debug!("Deref chain from node to LUB: {deref_found:?}");
+        if let FindLubVersion::NoMutualCoercion = version
+            && unsize_found
+            && let Some(_) = &deref_found
+        {
+            tracing::debug!("mutual coercion found -> bailing");
+            return None;
+        }
+        if unsize_found {
+            adjustments_by_node[node].path.push((lub, EdgeType::Unsize));
+            continue;
+        }
         if let Some(deref_found) = deref_found {
             adjustments_by_node[node].path.extend(deref_found);
             continue;
@@ -135,13 +154,6 @@ fn find_lub(nodes: &[NodeId], deref: &Graph, unsize: &Graph) -> Option<(NodeId, 
         // Then check if there exists a coercion from the current LUB to the new node
         let unsize_found = unsize.neighbors(lub).iter().any(|u| *u == node);
         tracing::debug!("Unsize found from LUB to to node: {unsize_found}");
-        if unsize_found {
-            for j in nodes[0..i].iter().copied() {
-                adjustments_by_node[j].path.push((node, EdgeType::Unsize));
-            }
-            lub = node;
-            continue;
-        }
         let deref_found = 'deref_found: {
             let mut current_node = lub;
             let mut deref_adjs = Vec::with_capacity(nodes.len());
@@ -160,6 +172,20 @@ fn find_lub(nodes: &[NodeId], deref: &Graph, unsize: &Graph) -> Option<(NodeId, 
             None
         };
         tracing::debug!("Deref chain found from LUB to to node: {deref_found:?}");
+        if let FindLubVersion::NoMutualCoercion = version
+            && unsize_found
+            && let Some(_) = &deref_found
+        {
+            tracing::debug!("mutual coercion found -> bailing");
+            return None;
+        }
+        if unsize_found {
+            for j in nodes[0..i].iter().copied() {
+                adjustments_by_node[j].path.push((node, EdgeType::Unsize));
+            }
+            lub = node;
+            continue;
+        }
         if let Some(deref_found) = deref_found {
             for j in nodes[0..i].iter().copied() {
                 adjustments_by_node[j]
@@ -186,13 +212,55 @@ fn write_graphs(file: &str, graphs: &[Graph]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn do_find_inner(
+    file: &mut BufWriter<File>,
+    n: usize,
+    di: usize,
+    deref: &Graph,
+    ui: usize,
+    unsize: &Graph,
+    version: FindLubVersion,
+) -> anyhow::Result<Option<(usize, Vec<Adjustment>)>> {
+    use itertools::Itertools;
+
+    let orderings: Vec<Vec<_>> = (0..n).permutations(n).collect();
+
+    let first = find_lub(&orderings[0], deref, unsize, version);
+    writeln!(file, "d{di}-u{ui}")?;
+    writeln!(file, "  {:?}: {first:?}", orderings[0])?;
+
+    for order in orderings.iter().skip(1) {
+        let new_lub = find_lub(&order, deref, unsize, version);
+        writeln!(file, "  {order:?}: {new_lub:?}")?;
+        if new_lub != first {
+            let mut mismatch_string = "\n".to_string();
+            writeln!(mismatch_string, "!!! MISMATCH FOUND !!!")?;
+            writeln!(
+                mismatch_string,
+                "Deref graph #{}: {:?}",
+                di,
+                deref.to_adj_list()
+            )?;
+            writeln!(
+                mismatch_string,
+                "Unsize graph #{}: {:?}",
+                ui,
+                unsize.to_adj_list()
+            )?;
+            writeln!(mismatch_string, "  {:?}: {first:?}", &orderings[0])?;
+            writeln!(mismatch_string, "  {:?}: {new_lub:?}", &order)?;
+            anyhow::bail!(mismatch_string);
+        }
+    }
+
+    Ok(first)
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(tracing_tree::HierarchicalLayer::new(2))
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-
-    use itertools::Itertools;
 
     for n in 3..=5 {
         let file = File::create(&format!("target/{n}-lubs.txt"))?;
@@ -212,6 +280,7 @@ fn main() -> anyhow::Result<()> {
         write_graphs(&format!("target/{n}-deref.txt"), &deref_graphs)?;
         write_graphs(&format!("target/{n}-unsize.txt"), &unsize_graphs)?;
 
+        let mut any_errors = false;
         let total = deref_graphs.len() * unsize_graphs.len();
         let mut count = 0;
         for (di, deref) in deref_graphs.iter().enumerate() {
@@ -221,24 +290,36 @@ fn main() -> anyhow::Result<()> {
                     println!("  Progress: {}/{}", count, total);
                 }
 
-                let orderings: Vec<Vec<_>> = (0..n).permutations(n).collect();
-                let first = find_lub(&orderings[0], deref, unsize);
-                writeln!(file, "d{di}-u{ui}")?;
-                writeln!(file, "  {:?}: {first:?}", orderings[0])?;
-
-                for order in orderings.iter().skip(1) {
-                    let new_lub = find_lub(&order, deref, unsize);
-                    writeln!(file, "  {order:?}: {new_lub:?}")?;
-                    if new_lub != first {
-                        println!("\n!!! MISMATCH FOUND !!!");
-                        println!("Deref graph #{}: {:?}", di, deref.to_adj_list());
-                        println!("Unsize graph #{}: {:?}", ui, unsize.to_adj_list());
-                        println!("  {:?}: {first:?}", &orderings[0]);
-                        println!("  {:?}: {new_lub:?}", &order);
-                        //return Err(anyhow::anyhow!("Mismatch found"));
+                let res_main =
+                    do_find_inner(&mut file, n, di, deref, ui, unsize, FindLubVersion::Main);
+                let res_no_mut = do_find_inner(
+                    &mut file,
+                    n,
+                    di,
+                    deref,
+                    ui,
+                    unsize,
+                    FindLubVersion::NoMutualCoercion,
+                );
+                match (&res_main, &res_no_mut) {
+                    (Ok(_), Ok(_)) => {}
+                    (Err(_), Err(_)) => {}
+                    _ => {
+                        //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
+                    }
+                }
+                match &res_no_mut {
+                    Ok(_) => {}
+                    Err(e) => {
+                        any_errors = true;
+                        tracing::info!(?e, "error in NoMututalCoercion");
                     }
                 }
             }
+        }
+        if any_errors {
+            break;
+            carg
         }
     }
     Ok(())
