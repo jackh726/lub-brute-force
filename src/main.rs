@@ -84,7 +84,6 @@ fn find_lub_simple(
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum AlgoChanges {
     NoMutualCoercion,
-    RequireDirect,
 }
 
 /// Finds the LUB type and adjustment paths for each node.
@@ -115,9 +114,9 @@ fn find_lub(
         }
 
         // First check if there exists a coercion to the LUB
-        let unsize_found = unsize.neighbors(node).iter().any(|u| *u == lub);
-        tracing::debug!("Unsize found from node to LUB: {unsize_found}");
-        let deref_found = 'deref_found: {
+        let unsize_to_lub = unsize.neighbors(node).iter().any(|u| *u == lub);
+        tracing::debug!("Unsize found from node to LUB: {unsize_to_lub}");
+        let deref_to_lub = 'deref_found: {
             let mut current_node = node;
             let mut deref_adjs = Vec::with_capacity(nodes.len());
             while let Some(deref_target) = deref.neighbors(current_node).first() {
@@ -134,27 +133,12 @@ fn find_lub(
             }
             None
         };
-        tracing::debug!("Deref chain from node to LUB: {deref_found:?}");
-        if unsize_found
-            && let Some(_) = &deref_found
-            && changes.contains(&AlgoChanges::NoMutualCoercion)
-        {
-            tracing::debug!("mutual coercion found -> bailing");
-            return None;
-        }
-        if unsize_found {
-            adjustments_by_node[node].path.push((lub, EdgeType::Unsize));
-            continue;
-        }
-        if let Some(deref_found) = deref_found {
-            adjustments_by_node[node].path.extend(deref_found);
-            continue;
-        }
+        tracing::debug!("Deref chain from node to LUB: {deref_to_lub:?}");
 
         // Then check if there exists a coercion from the current LUB to the new node
-        let unsize_found = unsize.neighbors(lub).iter().any(|u| *u == node);
-        tracing::debug!("Unsize found from LUB to to node: {unsize_found}");
-        let deref_found = 'deref_found: {
+        let unsize_to_new = unsize.neighbors(lub).iter().any(|u| *u == node);
+        tracing::debug!("Unsize found from LUB to to node: {unsize_to_new}");
+        let deref_to_new = 'deref_found: {
             let mut current_node = lub;
             let mut deref_adjs = Vec::with_capacity(nodes.len());
             while let Some(deref_target) = deref.neighbors(current_node).first() {
@@ -171,22 +155,33 @@ fn find_lub(
             }
             None
         };
-        tracing::debug!("Deref chain found from LUB to to node: {deref_found:?}");
-        if unsize_found
-            && let Some(_) = &deref_found
+        tracing::debug!("Deref chain found from LUB to to node: {deref_to_new:?}");
+
+        if (unsize_to_lub || deref_to_lub.is_some())
+            && (unsize_to_new || deref_to_new.is_some())
             && changes.contains(&AlgoChanges::NoMutualCoercion)
         {
             tracing::debug!("mutual coercion found -> bailing");
             return None;
         }
-        if unsize_found {
+
+        if unsize_to_lub {
+            adjustments_by_node[node].path.push((lub, EdgeType::Unsize));
+            continue;
+        }
+        if let Some(deref_found) = deref_to_lub {
+            adjustments_by_node[node].path.extend(deref_found);
+            continue;
+        }
+
+        if unsize_to_new {
             for j in nodes[0..i].iter().copied() {
                 adjustments_by_node[j].path.push((node, EdgeType::Unsize));
             }
             lub = node;
             continue;
         }
-        if let Some(deref_found) = deref_found {
+        if let Some(deref_found) = deref_to_new {
             for j in nodes[0..i].iter().copied() {
                 adjustments_by_node[j]
                     .path
@@ -256,19 +251,31 @@ fn do_find_inner(
     Ok(first)
 }
 
+#[derive(Default, Debug)]
+struct Stats {
+    ok_some_to_ok_none: usize,
+    both_ok: usize,
+    both_err: usize,
+    main_ok_no_mut_err: usize,
+    main_err_no_mut_ok_none: usize,
+    main_err_no_mut_ok_some: usize,
+    no_mut_ok: usize,
+    no_mut_err: usize,
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(tracing_tree::HierarchicalLayer::new(2))
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    for n in 3..=5 {
+    for n in 3..=4 {
         let file = File::create(&format!("target/{n}-lubs.txt"))?;
         let mut file = BufWriter::new(file);
         println!("Testing with {} nodes", n);
 
-        let deref_graphs = generate_deref_graphs(n);
-        let unsize_graphs = generate_unsizing_graphs(n);
+        let deref_graphs = generate_deref_graphs(n, false);
+        let unsize_graphs = generate_unsizing_graphs(n, false);
 
         println!("  Deref graphs: {}", deref_graphs.len());
         println!("  Unsize graphs: {}", unsize_graphs.len());
@@ -280,9 +287,9 @@ fn main() -> anyhow::Result<()> {
         write_graphs(&format!("target/{n}-deref.txt"), &deref_graphs)?;
         write_graphs(&format!("target/{n}-unsize.txt"), &unsize_graphs)?;
 
-        let mut any_errors = false;
         let total = deref_graphs.len() * unsize_graphs.len();
         let mut count = 0;
+        let mut stats = Stats::default();
         for (di, deref) in deref_graphs.iter().enumerate() {
             for (ui, unsize) in unsize_graphs.iter().enumerate() {
                 count += 1;
@@ -301,24 +308,37 @@ fn main() -> anyhow::Result<()> {
                     &[AlgoChanges::NoMutualCoercion],
                 );
                 match (&res_main, &res_no_mut) {
-                    (Ok(_), Ok(_)) => {}
-                    (Err(_), Err(_)) => {}
-                    _ => {
+                    (Ok(Some(_)), Ok(None)) => {
+                        stats.ok_some_to_ok_none += 1;
+                        //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
+                    }
+                    (Ok(_), Ok(_)) => stats.both_ok += 1,
+                    (Err(_), Err(_)) => stats.both_err += 1,
+                    (Ok(_), Err(_)) => {
+                        stats.main_ok_no_mut_err += 1;
+                        //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
+                    }
+                    (Err(_), Ok(None)) => {
+                        stats.main_err_no_mut_ok_none += 1;
+                        //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
+                    }
+                    (Err(_), Ok(Some(_))) => {
+                        stats.main_err_no_mut_ok_some += 1;
                         //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
                     }
                 }
                 match &res_no_mut {
-                    Ok(_) => {}
-                    Err(e) => {
-                        any_errors = true;
-                        tracing::info!(?e, "error in NoMututalCoercion");
+                    Ok(_) => {
+                        stats.no_mut_ok += 1;
+                    }
+                    Err(_) => {
+                        stats.no_mut_err += 1;
+                        //tracing::info!(?res_no_mut, "error in NoMututalCoercion");
                     }
                 }
             }
         }
-        if any_errors {
-            break;
-        }
+        tracing::info!("Algorithm comparison stats: {:#?}", stats);
     }
     Ok(())
 }

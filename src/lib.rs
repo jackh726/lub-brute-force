@@ -112,9 +112,9 @@ pub fn is_weakly_connected(n: usize, edges: &[(NodeId, NodeId)]) -> bool {
 ///
 /// Constraints:
 /// - Each node has at most one outgoing deref edge
-/// - Graph is weakly connected
+/// - Graph is weakly connected (if `require_connected` is true)
 /// - No self-loops
-pub fn generate_deref_graphs(n: usize) -> Vec<Graph> {
+pub fn generate_deref_graphs(n: usize, require_connected: bool) -> Vec<Graph> {
     let mut graphs = vec![];
     let max_edges = n - 1;
 
@@ -142,7 +142,7 @@ pub fn generate_deref_graphs(n: usize) -> Vec<Graph> {
                 if out_degree.iter().any(|&d| d > 1) {
                     continue;
                 }
-                if !is_weakly_connected(n, &edges) {
+                if require_connected && !is_weakly_connected(n, &edges) {
                     continue;
                 }
 
@@ -161,9 +161,9 @@ pub fn generate_deref_graphs(n: usize) -> Vec<Graph> {
 ///
 /// Constraints:
 /// - Graph is a DAG (no cycles)
-/// - Graph is weakly connected
+/// - Graph is weakly connected (if `require_connected` is true)
 /// - No self-loops
-pub fn generate_unsizing_graphs(n: usize) -> Vec<Graph> {
+pub fn generate_unsizing_graphs(n: usize, require_connected: bool) -> Vec<Graph> {
     let mut graphs = HashSet::new();
     let all_edges: Vec<_> = (0..n)
         .cartesian_product(0..n)
@@ -176,28 +176,28 @@ pub fn generate_unsizing_graphs(n: usize) -> Vec<Graph> {
         graph: &mut Graph,
         graphs: &mut HashSet<Graph>,
         n: usize,
+        require_connected: bool,
     ) {
-        if !has_cycle(graph) {
-            let edge_list: Vec<_> = (0..n)
-                .flat_map(|i| graph.neighbors(i).iter().map(move |&j| (i, j)))
-                .collect();
-            if is_weakly_connected(n, &edge_list) {
-                graphs.insert(graph.clone());
-            }
-        } else {
+        if has_cycle(graph) {
             return;
+        }
+        let edge_list: Vec<_> = (0..n)
+            .flat_map(|i| graph.neighbors(i).iter().map(move |&j| (i, j)))
+            .collect();
+        if !require_connected || is_weakly_connected(n, &edge_list) {
+            graphs.insert(graph.clone());
         }
 
         for i in idx..edges.len() {
             let (from, to) = edges[i];
             graph.push_edge(from, to);
-            backtrack(i + 1, edges, graph, graphs, n);
+            backtrack(i + 1, edges, graph, graphs, n, require_connected);
             graph.pop_edge(from);
         }
     }
 
     let mut graph = Graph::new(n);
-    backtrack(0, &all_edges, &mut graph, &mut graphs, n);
+    backtrack(0, &all_edges, &mut graph, &mut graphs, n, require_connected);
     graphs.into_iter().collect()
 }
 
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn test_deref_graphs_no_multi_out_edges() {
         for n in 2..=4 {
-            let graphs = generate_deref_graphs(n);
+            let graphs = generate_deref_graphs(n, false);
             for graph in &graphs {
                 for node in 0..graph.len() {
                     assert!(
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn test_deref_graphs_weakly_connected() {
         for n in 2..=4 {
-            let graphs = generate_deref_graphs(n);
+            let graphs = generate_deref_graphs(n, true);
             for graph in &graphs {
                 let edges: Vec<_> = (0..n)
                     .flat_map(|i| graph.neighbors(i).iter().map(move |&j| (i, j)))
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_deref_graphs_no_self_loops() {
         for n in 2..=4 {
-            let graphs = generate_deref_graphs(n);
+            let graphs = generate_deref_graphs(n, false);
             for graph in &graphs {
                 for i in 0..graph.len() {
                     assert!(
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn test_unsizing_graphs_no_cycles() {
         for n in 2..=3 {
-            let graphs = generate_unsizing_graphs(n);
+            let graphs = generate_unsizing_graphs(n, false);
             for graph in &graphs {
                 assert!(!has_cycle(graph), "Cycle found in unsizing graph");
             }
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn test_unsizing_graphs_weakly_connected() {
         for n in 2..=3 {
-            let graphs = generate_unsizing_graphs(n);
+            let graphs = generate_unsizing_graphs(n, true);
             for graph in &graphs {
                 let edges: Vec<_> = (0..n)
                     .flat_map(|i| graph.neighbors(i).iter().map(move |&j| (i, j)))
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn test_unsizing_graphs_no_self_loops() {
         for n in 2..=3 {
-            let graphs = generate_unsizing_graphs(n);
+            let graphs = generate_unsizing_graphs(n, false);
             for graph in &graphs {
                 for i in 0..graph.len() {
                     assert!(
@@ -319,8 +319,9 @@ mod tests {
 
     #[test]
     fn test_small_deref_graph_count() {
-        assert_eq!(generate_deref_graphs(2).len(), 2); // empty or 0->1 or 1->0
-        let graphs_3 = generate_deref_graphs(3);
+        assert_eq!(generate_deref_graphs(2, true).len(), 2); // 0->1 or 1->0
+        assert_eq!(generate_deref_graphs(2, false).len(), 3); // empty or 0->1 or 1->0
+        let graphs_3 = generate_deref_graphs(3, false);
         assert!(
             graphs_3.len() > 0,
             "Should generate some 3-node deref graphs"
