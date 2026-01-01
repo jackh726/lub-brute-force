@@ -13,10 +13,7 @@ use std::{
 use tracing_subscriber::prelude::*;
 
 /// Represents an adjustment path from a node to the LUB type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Adjustment {
-    path: Vec<(NodeId, EdgeType)>,
-}
+type Adjustment = Vec<(NodeId, EdgeType)>;
 
 /// Type of coercion edge in the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,7 +36,7 @@ fn find_lub_simple(
     unsize: &Graph,
 ) -> Option<(NodeId, Vec<Adjustment>)> {
     let max_node = *nodes.iter().max()?;
-    let mut adjustments_by_node = vec![Adjustment { path: vec![] }; max_node + 1];
+    let mut adjustments_by_node = vec![vec![]; max_node + 1];
     let mut common_lub = None;
 
     for &start_node in nodes {
@@ -74,8 +71,7 @@ fn find_lub_simple(
             common_lub = Some(lub);
         }
 
-        let path = reachable.get(&lub).cloned().unwrap_or_default();
-        adjustments_by_node[start_node] = Adjustment { path };
+        adjustments_by_node[start_node] = reachable.get(&lub).cloned().unwrap_or_default();
     }
 
     Some((common_lub?, adjustments_by_node))
@@ -122,7 +118,7 @@ fn find_lub(
 ) -> Option<(NodeId, Vec<Adjustment>)> {
     tracing::debug!(deref = ?deref.to_adj_list(), unsize = ?unsize.to_adj_list());
     let mut lub = nodes[0];
-    let mut adjustments_by_node = vec![Adjustment { path: vec![] }; nodes.len()];
+    let mut adjustments_by_node = vec![vec![]; nodes.len()];
 
     for (i, node) in nodes.iter().copied().enumerate() {
         let arm_span = tracing::debug_span!("arm coercion", ?node, ?lub, ?adjustments_by_node);
@@ -136,15 +132,13 @@ fn find_lub(
 
         // First check if there exists a coercion to the LUB
         let unsize_to_lub = does_unsize(node, lub, unsize);
-        tracing::debug!("Unsize found from node to LUB: {unsize_to_lub}");
         let deref_to_lub = does_deref(node, lub, deref);
-        tracing::debug!("Deref chain from node to LUB: {deref_to_lub:?}");
 
         // Then check if there exists a coercion from the current LUB to the new node
         let unsize_to_new = does_unsize(lub, node, unsize);
-        tracing::debug!("Unsize found from LUB to new node: {unsize_to_new}");
         let deref_to_new = does_deref(lub, node, deref);
-        tracing::debug!("Deref chain found from LUB to new node: {deref_to_new:?}");
+
+        tracing::debug!(?unsize_to_lub, ?deref_to_lub, ?unsize_to_new, ?deref_to_new);
 
         if (unsize_to_lub || deref_to_lub.is_some())
             && (unsize_to_new || deref_to_new.is_some())
@@ -155,30 +149,30 @@ fn find_lub(
         }
 
         if unsize_to_lub {
-            adjustments_by_node[node].path.push((lub, EdgeType::Unsize));
+            adjustments_by_node[node].push((lub, EdgeType::Unsize));
             continue;
         }
         if let Some(deref_found) = deref_to_lub {
-            adjustments_by_node[node].path.extend(deref_found);
+            adjustments_by_node[node].extend(deref_found);
             continue;
         }
 
         if unsize_to_new {
             for j in nodes[0..i].iter().copied() {
-                adjustments_by_node[j].path.push((node, EdgeType::Unsize));
+                adjustments_by_node[j].push((node, EdgeType::Unsize));
             }
             if !changes.contains(&AlgoChanges::RequireDirect) {
                 for j in nodes[0..i].iter().copied() {
-                    adjustments_by_node[j].path.push((node, EdgeType::Unsize));
+                    adjustments_by_node[j].push((node, EdgeType::Unsize));
                 }
             } else {
                 for j in nodes[0..i].iter().copied() {
                     let unsize_direct = does_unsize(j, node, unsize);
                     let deref_direct = does_deref(j, node, deref);
                     if unsize_direct {
-                        adjustments_by_node[j].path = vec![(node, EdgeType::Unsize)];
+                        adjustments_by_node[j] = vec![(node, EdgeType::Unsize)];
                     } else if let Some(deref_direct) = deref_direct {
-                        adjustments_by_node[j].path = deref_direct;
+                        adjustments_by_node[j] = deref_direct;
                     } else {
                         tracing::debug!(?j, ?node, "no direct coercion available");
                         return None;
@@ -191,18 +185,16 @@ fn find_lub(
         if let Some(deref_found) = deref_to_new {
             if !changes.contains(&AlgoChanges::RequireDirect) {
                 for j in nodes[0..i].iter().copied() {
-                    adjustments_by_node[j]
-                        .path
-                        .extend(deref_found.iter().copied());
+                    adjustments_by_node[j].extend(deref_found.iter().copied());
                 }
             } else {
                 for j in nodes[0..i].iter().copied() {
                     let unsize_direct = does_unsize(j, node, unsize);
                     let deref_direct = does_deref(j, node, deref);
                     if unsize_direct {
-                        adjustments_by_node[j].path = vec![(node, EdgeType::Unsize)];
+                        adjustments_by_node[j] = vec![(node, EdgeType::Unsize)];
                     } else if let Some(deref_direct) = deref_direct {
-                        adjustments_by_node[j].path = deref_direct;
+                        adjustments_by_node[j] = deref_direct;
                     } else {
                         tracing::debug!(?j, ?node, "no direct coercion available");
                         return None;
@@ -283,8 +275,7 @@ enum ErrorKind {
 }
 
 fn do_find_inner(
-    file: &mut BufWriter<File>,
-    n: usize,
+    mut file: Option<&mut BufWriter<File>>,
     di: usize,
     deref: &Graph,
     ui: usize,
@@ -293,15 +284,19 @@ fn do_find_inner(
 ) -> Result<Option<(usize, Vec<Adjustment>)>, Box<Error>> {
     use itertools::Itertools;
 
-    let orderings: Vec<Vec<_>> = (0..n).permutations(n).collect();
+    let orderings: Vec<Vec<_>> = (0..deref.len()).permutations(deref.len()).collect();
 
     let first = find_lub(&orderings[0], deref, unsize, changes);
-    writeln!(file, "d{di}-u{ui}").unwrap();
-    writeln!(file, "  {:?}: {first:?}", orderings[0]).unwrap();
+    if let Some(file) = file.as_mut() {
+        writeln!(file, "d{di}-u{ui}").unwrap();
+        writeln!(file, "  {:?}: {first:?}", orderings[0]).unwrap();
+    }
 
     for order in orderings.iter().skip(1) {
         let new_lub = find_lub(&order, deref, unsize, changes);
-        writeln!(file, "  {order:?}: {new_lub:?}").unwrap();
+        if let Some(file) = file.as_mut() {
+            writeln!(file, "  {order:?}: {new_lub:?}").unwrap();
+        }
         if first != new_lub {
             let kind = match (&first, &new_lub) {
                 (Some(first), Some(second)) if first.0 != second.0 => ErrorKind::DifferentLUB,
@@ -364,10 +359,9 @@ fn main() -> anyhow::Result<()> {
                     println!("  Progress: {}/{}", count, total);
                 }
 
-                let res_main = do_find_inner(&mut file, n, di, deref, ui, unsize, &[]);
+                let res_main = do_find_inner(Some(&mut file), di, deref, ui, unsize, &[]);
                 let res_no_mut = do_find_inner(
-                    &mut file,
-                    n,
+                    Some(&mut file),
                     di,
                     deref,
                     ui,
@@ -431,4 +425,59 @@ fn main() -> anyhow::Result<()> {
         println!("Algorithm comparison stats:\n{}", print_map(&paired_stats));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn ex5() {
+        let deref = &Graph::from_adj_list(vec![vec![1], vec![3], vec![3], vec![]]);
+        let unsize = &Graph::from_adj_list(vec![vec![], vec![], vec![], vec![]]);
+
+        let order_a = &[0, 1, 2, 3];
+        let order_b = &[3, 0, 1, 2];
+
+        let main_a = find_lub(order_a, deref, unsize, &[]);
+        let mod_a = find_lub(
+            order_a,
+            deref,
+            unsize,
+            &[AlgoChanges::NoMutualCoercion, AlgoChanges::RequireDirect],
+        );
+        let main_b = find_lub(order_b, deref, unsize, &[]);
+        let mod_b = find_lub(
+            order_b,
+            deref,
+            unsize,
+            &[AlgoChanges::NoMutualCoercion, AlgoChanges::RequireDirect],
+        );
+        assert_eq!(main_a, None);
+        assert_eq!(mod_a, None);
+        assert_eq!(
+            main_b,
+            Some((
+                3,
+                vec![
+                    vec![(1, EdgeType::Deref), (3, EdgeType::Deref)],
+                    vec![(3, EdgeType::Deref)],
+                    vec![(3, EdgeType::Deref)],
+                    vec![]
+                ]
+            ))
+        );
+        assert_eq!(
+            mod_b,
+            Some((
+                3,
+                vec![
+                    vec![(1, EdgeType::Deref), (3, EdgeType::Deref)],
+                    vec![(3, EdgeType::Deref)],
+                    vec![(3, EdgeType::Deref)],
+                    vec![]
+                ]
+            ))
+        );
+    }
 }
