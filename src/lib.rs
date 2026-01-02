@@ -226,6 +226,41 @@ pub fn has_cycle(graph: &Graph) -> bool {
     (0..n).any(|i| dfs(i, graph, &mut state))
 }
 
+/// Removes isomorphic duplicates from graph pairs.
+/// Two pairs (d1,u1) and (d2,u2) are isomorphic if there exists a permutation
+/// that makes both d1≅d2 and u1≅u2 under the same relabeling.
+pub fn deduplicate_graph_pairs(pairs: Vec<(Graph, Graph)>) -> Vec<(Graph, Graph)> {
+    let mut seen = HashSet::new();
+    pairs
+        .into_iter()
+        .filter(|(deref, unsize)| {
+            let n = deref.len();
+            let canonical = (0..n)
+                .permutations(n)
+                .map(|perm| {
+                    let deref_adj = deref.to_adj_list();
+                    let unsize_adj = unsize.to_adj_list();
+
+                    let mut deref_matrix = vec![vec![false; n]; n];
+                    let mut unsize_matrix = vec![vec![false; n]; n];
+
+                    for i in 0..n {
+                        for &j in &deref_adj[perm[i]] {
+                            deref_matrix[i][perm.iter().position(|&x| x == j).unwrap()] = true;
+                        }
+                        for &j in &unsize_adj[perm[i]] {
+                            unsize_matrix[i][perm.iter().position(|&x| x == j).unwrap()] = true;
+                        }
+                    }
+                    (deref_matrix, unsize_matrix)
+                })
+                .min()
+                .unwrap();
+            seen.insert(canonical)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

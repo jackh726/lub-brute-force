@@ -3,6 +3,7 @@
 //! This fuzzer generates all possible digraphs for deref and unsizing coercions,
 //! then tests whether different orderings of match arms produce consistent results.
 
+use itertools::Itertools;
 use lub_fuzz::*;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -390,102 +391,109 @@ fn main() -> anyhow::Result<()> {
         let deref_graphs = generate_deref_graphs(n, false);
         let unsize_graphs = generate_unsizing_graphs(n, false);
 
+        // Generate all pairs and deduplicate isomorphic ones
+        let all_pairs: Vec<_> = deref_graphs
+            .iter()
+            .cartesian_product(unsize_graphs.iter())
+            .map(|(d, u)| (d.clone(), u.clone()))
+            .collect();
+        let unique_pairs = deduplicate_graph_pairs(all_pairs);
+
         println!("  Deref graphs: {}", deref_graphs.len());
         println!("  Unsize graphs: {}", unsize_graphs.len());
         println!(
             "  Total pairs: {}",
             deref_graphs.len() * unsize_graphs.len()
         );
+        println!("  Unique pairs: {}", unique_pairs.len());
 
         write_graphs(&format!("target/{n}-deref.txt"), &deref_graphs)?;
         write_graphs(&format!("target/{n}-unsize.txt"), &unsize_graphs)?;
 
-        let total = deref_graphs.len() * unsize_graphs.len();
+        let total = unique_pairs.len();
         let mut count = 0;
         let mut stats = Stats::default();
         let mut paired_stats: HashMap<_, usize> = HashMap::new();
-        for (di, deref) in deref_graphs.iter().enumerate() {
-            for (ui, unsize) in unsize_graphs.iter().enumerate() {
-                count += 1;
-                if count % 10000 == 0 {
-                    println!("  Progress: {}/{}", count, total);
-                }
+        for (i, (deref, unsize)) in unique_pairs.iter().enumerate() {
+            count += 1;
+            if count % 10000 == 0 {
+                println!("  Progress: {}/{}", count, total);
+            }
 
-                let res_main = do_find_inner(
-                    Some(&mut file),
-                    di,
-                    deref,
-                    ui,
-                    unsize,
-                    &[
-                        AlgoChanges::RequireDirect,
-                        AlgoChanges::NoMutualCoercion,
-                        //AlgoChanges::DelayArms,
-                    ],
-                );
-                let res_no_mut = do_find_inner(
-                    Some(&mut file),
-                    di,
-                    deref,
-                    ui,
-                    unsize,
-                    &[
-                        AlgoChanges::RequireDirect,
-                        AlgoChanges::NoMutualCoercion,
-                        AlgoChanges::DelayArms,
-                    ],
-                );
-                match (&res_main, &res_no_mut) {
-                    (Ok(Some(v)), Ok(None)) => {
-                        *paired_stats.entry((Ok(Some(v.0)), Ok(None))).or_default() += 1;
-                        //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
-                    }
-                    (Ok(None), Ok(Some(v))) => {
-                        *paired_stats.entry((Ok(None), Ok(Some(v.0)))).or_default() += 1;
-                    }
-                    (Ok(Some(v1)), Ok(Some(v2))) => {
-                        *paired_stats
-                            .entry((Ok(Some(v1.0)), Ok(Some(v2.0))))
-                            .or_default() += 1;
-                    }
-                    (Ok(None), Ok(None)) => {
-                        *paired_stats.entry((Ok(None), Ok(None))).or_default() += 1;
-                    }
-                    (Err(e1), Err(e2)) => {
-                        *paired_stats
-                            .entry((Err(e1.kind), Err(e2.kind)))
-                            .or_default() += 1;
-                        //tracing::info!(main_error = display(error_string(&**e1, di, deref, ui, unsize)), change_error = display(error_string(&**e2, di, deref, ui, unsize)), "change in behavior");
-                    }
-                    (Ok(Some(v)), Err(e)) => {
-                        *paired_stats
-                            .entry((Ok(Some(v.0)), Err(e.kind)))
-                            .or_default() += 1;
-                        //tracing::info!(?res_main, change_error = display(error_string(&**e, di, deref, ui, unsize)), "change in behavior");
-                    }
-                    (Ok(None), Err(e)) => {
-                        *paired_stats.entry((Ok(None), Err(e.kind))).or_default() += 1;
-                        //tracing::info!(?res_main, change_error = display(error_string(&**e, di, deref, ui, unsize)), "change in behavior");
-                    }
-                    (Err(e), Ok(None)) => {
-                        *paired_stats.entry((Err(e.kind), Ok(None))).or_default() += 1;
-                        //tracing::info!(main_error = display(error_string(&**e, di, deref, ui, unsize)), ?res_no_mut, "change in behavior");
-                    }
-                    (Err(e), Ok(Some(v))) => {
-                        *paired_stats
-                            .entry((Err(e.kind), Ok(Some(v.0))))
-                            .or_default() += 1;
-                        //tracing::info!(main_error = display(error_string(&**e, di, deref, ui, unsize)), ?res_no_mut, "change in behavior");
-                    }
+            let res_main = do_find_inner(
+                Some(&mut file),
+                i, // Use index instead of di
+                deref,
+                i, // Use index instead of ui
+                unsize,
+                &[
+                    AlgoChanges::RequireDirect,
+                    AlgoChanges::NoMutualCoercion,
+                    //AlgoChanges::DelayArms,
+                ],
+            );
+            let res_no_mut = do_find_inner(
+                Some(&mut file),
+                i, // Use index instead of di
+                deref,
+                i, // Use index instead of ui
+                unsize,
+                &[
+                    AlgoChanges::RequireDirect,
+                    AlgoChanges::NoMutualCoercion,
+                    AlgoChanges::DelayArms,
+                ],
+            );
+            match (&res_main, &res_no_mut) {
+                (Ok(Some(v)), Ok(None)) => {
+                    *paired_stats.entry((Ok(Some(v.0)), Ok(None))).or_default() += 1;
+                    //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
                 }
-                match &res_no_mut {
-                    Ok(_) => {
-                        stats.no_mut_ok += 1;
-                    }
-                    Err(_) => {
-                        stats.no_mut_err += 1;
-                        //tracing::info!(?res_no_mut, "error in NoMututalCoercion");
-                    }
+                (Ok(None), Ok(Some(v))) => {
+                    *paired_stats.entry((Ok(None), Ok(Some(v.0)))).or_default() += 1;
+                }
+                (Ok(Some(v1)), Ok(Some(v2))) => {
+                    *paired_stats
+                        .entry((Ok(Some(v1.0)), Ok(Some(v2.0))))
+                        .or_default() += 1;
+                }
+                (Ok(None), Ok(None)) => {
+                    *paired_stats.entry((Ok(None), Ok(None))).or_default() += 1;
+                }
+                (Err(e1), Err(e2)) => {
+                    *paired_stats
+                        .entry((Err(e1.kind), Err(e2.kind)))
+                        .or_default() += 1;
+                    //tracing::info!(main_error = display(error_string(&**e1, di, deref, ui, unsize)), change_error = display(error_string(&**e2, di, deref, ui, unsize)), "change in behavior");
+                }
+                (Ok(Some(v)), Err(e)) => {
+                    *paired_stats
+                        .entry((Ok(Some(v.0)), Err(e.kind)))
+                        .or_default() += 1;
+                    //tracing::info!(?res_main, change_error = display(error_string(&**e, di, deref, ui, unsize)), "change in behavior");
+                }
+                (Ok(None), Err(e)) => {
+                    *paired_stats.entry((Ok(None), Err(e.kind))).or_default() += 1;
+                    //tracing::info!(?res_main, change_error = display(error_string(&**e, i, deref, i, unsize)), "change in behavior");
+                }
+                (Err(e), Ok(None)) => {
+                    *paired_stats.entry((Err(e.kind), Ok(None))).or_default() += 1;
+                    //tracing::info!(main_error = display(error_string(&**e, i, deref, i, unsize)), ?res_no_mut, "change in behavior");
+                }
+                (Err(e), Ok(Some(v))) => {
+                    *paired_stats
+                        .entry((Err(e.kind), Ok(Some(v.0))))
+                        .or_default() += 1;
+                    //tracing::info!(main_error = display(error_string(&**e, i, deref, i, unsize)), ?res_no_mut, "change in behavior");
+                }
+            }
+            match &res_no_mut {
+                Ok(_) => {
+                    stats.no_mut_ok += 1;
+                }
+                Err(_) => {
+                    stats.no_mut_err += 1;
+                    //tracing::info!(?res_no_mut, "error in NoMututalCoercion");
                 }
             }
         }
