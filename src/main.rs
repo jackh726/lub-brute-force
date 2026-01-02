@@ -5,7 +5,7 @@
 
 use lub_fuzz::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, hash_map::Entry},
     fmt::{Debug, Write as _},
     fs::File,
     io::{BufWriter, Write},
@@ -114,6 +114,7 @@ fn does_coerce(
 enum AlgoChanges {
     NoMutualCoercion,
     RequireDirect,
+    DelayArms,
 }
 
 /// Finds the LUB type and adjustment paths for each node.
@@ -132,6 +133,7 @@ fn find_lub(
     tracing::debug!(deref = ?deref.to_adj_list(), unsize = ?unsize.to_adj_list());
     let mut lub = nodes[0];
     let mut adjustments_by_node = vec![vec![]; nodes.len()];
+    let mut has_delayed_arms = false;
 
     for (i, node) in nodes.iter().copied().enumerate() {
         let arm_span = tracing::debug_span!("arm coercion", ?node, ?lub, ?adjustments_by_node);
@@ -141,6 +143,21 @@ fn find_lub(
             // Node is equal to the LUB (in this algorithm, will only actually happen on the first branch)
             // Nothing to do, no adjustments to be made
             continue;
+        }
+
+        if has_delayed_arms {
+            assert!(changes.contains(&AlgoChanges::DelayArms));
+            // Some thoughts:
+            // If we skip an arm, then some subsequent arm must be the LUB.
+            // - If the LUB was an already found arm, then the skipped arm would have to coerce to it *somehow*
+            //    - A deref chain would be found when originally checking that arm
+            //    - An unsize would have to be *direct*, which would have been found
+            // - The skipped arm itself cannot be the LUB
+            //    - Prior arms would have to directly coerce
+            // - Therefore, the skipped arm must coerce (somehow) into the LUB
+
+            // Consequently:
+            //
         }
 
         // First check if there exists a coercion to the LUB
@@ -168,29 +185,45 @@ fn find_lub(
                 for j in nodes[0..i].iter().copied() {
                     adjustments_by_node[j].extend(coerce.iter().copied());
                 }
+                has_delayed_arms = false;
                 lub = node;
                 continue;
             }
         } else {
             if let Some(_) = coerce_to_new {
+                let mut any_failed = false;
                 for j in nodes[0..i].iter().copied() {
                     let coerce_direct = does_coerce(j, node, unsize, deref);
                     if let Some(coerce_direct) = coerce_direct {
                         adjustments_by_node[j] = coerce_direct;
                     } else {
-                        tracing::debug!(?j, ?node, "no direct coercion available");
-                        return None;
+                        if changes.contains(&AlgoChanges::DelayArms) {
+                            any_failed = true;
+                        } else {
+                            tracing::debug!(?j, ?node, "no direct coercion available");
+                            return None;
+                        }
                     }
                 }
+                has_delayed_arms = any_failed;
                 lub = node;
                 continue;
             }
         }
 
-        return None;
+        if changes.contains(&AlgoChanges::DelayArms) {
+            has_delayed_arms = true;
+        } else {
+            return None;
+        }
     }
 
-    Some((lub, adjustments_by_node))
+    if has_delayed_arms {
+        assert!(changes.contains(&AlgoChanges::DelayArms));
+        None
+    } else {
+        Some((lub, adjustments_by_node))
+    }
 }
 
 /// Writes graphs to a file for inspection.
@@ -221,15 +254,9 @@ fn error_string(error: &Error, di: usize, deref: &Graph, ui: usize, unsize: &Gra
         unsize.to_adj_list()
     )
     .unwrap();
-    let Error {
-        first_order,
-        second_order,
-        first_result,
-        second_result,
-        ..
-    } = error;
-    writeln!(mismatch_string, "  {first_order:?}: {first_result:?}").unwrap();
-    writeln!(mismatch_string, "  {second_order:?}: {second_result:?}").unwrap();
+    for error in error.error_data.iter() {
+        writeln!(mismatch_string, "  {:?}: {:?}", error.order, error.result).unwrap();
+    }
 
     mismatch_string
 }
@@ -245,16 +272,25 @@ fn print_map<K: Debug, V: Debug>(map: &HashMap<K, V>) -> String {
 #[derive(Clone, Debug)]
 struct Error {
     kind: ErrorKind,
-    first_order: Vec<NodeId>,
-    second_order: Vec<NodeId>,
-    first_result: Option<(usize, Vec<Adjustment>)>,
-    second_result: Option<(usize, Vec<Adjustment>)>,
+    error_data: HashSet<ErrorData>,
 }
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum ErrorKind {
-    TwoDifferentLUBs,
+    // All orderings found a LUB, but there were at least two different ones found
+    DifferentLUBs,
+    // Some orderings did not find a LUB, but of the orderings that did, they were all the same
     MissingLUB,
+    // All orderings found a LUB, but the adjustments to get there varied
     DifferentAdjustments(NodeId),
+    // There were multiple types of inconsitencies across orderings
+    Mixed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ErrorData {
+    order: Vec<NodeId>,
+    result: Option<(usize, Vec<Adjustment>)>,
 }
 
 fn do_find_inner(
@@ -269,36 +305,69 @@ fn do_find_inner(
 
     let orderings: Vec<Vec<_>> = (0..deref.len()).permutations(deref.len()).collect();
 
-    let first = find_lub(&orderings[0], deref, unsize, changes);
     if let Some(file) = file.as_mut() {
         writeln!(file, "d{di}-u{ui}").unwrap();
-        writeln!(file, "  {:?}: {first:?}", orderings[0]).unwrap();
     }
 
-    for order in orderings.iter().skip(1) {
+    let mut lub_map = HashMap::with_capacity(deref.len() * 2);
+    for order in orderings.iter() {
         let new_lub = find_lub(&order, deref, unsize, changes);
-        if let Some(file) = file.as_mut() {
-            writeln!(file, "  {order:?}: {new_lub:?}").unwrap();
-        }
-        if first != new_lub {
-            let kind = match (&first, &new_lub) {
-                (Some(first), Some(second)) if first.0 != second.0 => ErrorKind::TwoDifferentLUBs,
-
-                (None, Some(_)) | (Some(_), None) => ErrorKind::MissingLUB,
-                (Some(first), Some(_)) => ErrorKind::DifferentAdjustments(first.0),
-                (None, None) => unreachable!(),
-            };
-            return Err(Box::new(Error {
-                kind,
-                first_order: orderings[0].clone(),
-                second_order: order.clone(),
-                first_result: first,
-                second_result: new_lub,
-            }));
+        match lub_map.entry(new_lub) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(vacant_entry) => {
+                if let Some(file) = file.as_mut() {
+                    writeln!(file, "  {order:?}: {:?}", vacant_entry.key()).unwrap();
+                }
+                vacant_entry.insert(order.clone());
+            }
         }
     }
 
-    Ok(first)
+    let first = lub_map.iter().next().unwrap().0.clone();
+    let mut error = None;
+    let mut errors = HashSet::new();
+    for perm in lub_map.into_iter().combinations(2) {
+        let mut perm = perm.into_iter();
+        let (first, first_order) = perm.next().unwrap();
+        let (second, second_order) = perm.next().unwrap();
+
+        let error_kind = match (&first, &second) {
+            (Some(first), Some(second)) if first.0 != second.0 => ErrorKind::DifferentLUBs,
+
+            (None, Some(_)) | (Some(_), None) => ErrorKind::MissingLUB,
+            (Some(first), Some(second)) if first != second => {
+                ErrorKind::DifferentAdjustments(first.0)
+            }
+            (Some(_), Some(_)) | (None, None) => continue,
+        };
+
+        errors.insert(ErrorData {
+            order: first_order,
+            result: first,
+        });
+        errors.insert(ErrorData {
+            order: second_order,
+            result: second,
+        });
+
+        match (error, error_kind) {
+            (Some(ErrorKind::Mixed), _) => unreachable!(),
+            (Some(e1), e2) if e1 != e2 => error = Some(ErrorKind::Mixed),
+            (_, error_kind) => error = Some(error_kind),
+        }
+        if let Some(ErrorKind::Mixed) = error {
+            // Early exit (this is a combination of multiple)
+            break;
+        }
+    }
+
+    match error {
+        Some(kind) => Err(Box::new(Error {
+            kind,
+            error_data: errors,
+        })),
+        None => Ok(first),
+    }
 }
 
 #[derive(Default, Debug)]
@@ -342,14 +411,29 @@ fn main() -> anyhow::Result<()> {
                     println!("  Progress: {}/{}", count, total);
                 }
 
-                let res_main = do_find_inner(Some(&mut file), di, deref, ui, unsize, &[]);
+                let res_main = do_find_inner(
+                    Some(&mut file),
+                    di,
+                    deref,
+                    ui,
+                    unsize,
+                    &[
+                        AlgoChanges::RequireDirect,
+                        AlgoChanges::NoMutualCoercion,
+                        //AlgoChanges::DelayArms,
+                    ],
+                );
                 let res_no_mut = do_find_inner(
                     Some(&mut file),
                     di,
                     deref,
                     ui,
                     unsize,
-                    &[AlgoChanges::NoMutualCoercion, AlgoChanges::RequireDirect],
+                    &[
+                        AlgoChanges::RequireDirect,
+                        AlgoChanges::NoMutualCoercion,
+                        AlgoChanges::DelayArms,
+                    ],
                 );
                 match (&res_main, &res_no_mut) {
                     (Ok(Some(v)), Ok(None)) => {
@@ -371,20 +455,21 @@ fn main() -> anyhow::Result<()> {
                         *paired_stats
                             .entry((Err(e1.kind), Err(e2.kind)))
                             .or_default() += 1;
+                        //tracing::info!(main_error = display(error_string(&**e1, di, deref, ui, unsize)), change_error = display(error_string(&**e2, di, deref, ui, unsize)), "change in behavior");
                     }
                     (Ok(Some(v)), Err(e)) => {
                         *paired_stats
                             .entry((Ok(Some(v.0)), Err(e.kind)))
                             .or_default() += 1;
-                        //tracing::info!(?res_main, change_error = error_string(&**e, di, deref, ui, unsize), "change in behavior");
+                        //tracing::info!(?res_main, change_error = display(error_string(&**e, di, deref, ui, unsize)), "change in behavior");
                     }
                     (Ok(None), Err(e)) => {
                         *paired_stats.entry((Ok(None), Err(e.kind))).or_default() += 1;
-                        //tracing::info!(?res_main, change_error = error_string(&**e, di, deref, ui, unsize), "change in behavior");
+                        //tracing::info!(?res_main, change_error = display(error_string(&**e, di, deref, ui, unsize)), "change in behavior");
                     }
                     (Err(e), Ok(None)) => {
                         *paired_stats.entry((Err(e.kind), Ok(None))).or_default() += 1;
-                        //tracing::info!(main_error = error_string(&**e, di, deref, ui, unsize), ?res_no_mut, "change in behavior");
+                        //tracing::info!(main_error = display(error_string(&**e, di, deref, ui, unsize)), ?res_no_mut, "change in behavior");
                     }
                     (Err(e), Ok(Some(v))) => {
                         *paired_stats
@@ -459,6 +544,41 @@ mod test {
                     vec![(3, EdgeType::Deref)],
                     vec![(3, EdgeType::Deref)],
                     vec![]
+                ]
+            ))
+        );
+    }
+
+    #[test]
+    fn delay_adds_more_differences() {
+        let deref = &Graph::from_adj_list(vec![vec![1], vec![], vec![]]);
+        let unsize = &Graph::from_adj_list(vec![vec![], vec![0], vec![1]]);
+
+        let order_a = &[0, 1, 2];
+        let order_b = &[2, 0, 1];
+
+        let main_changes = &[AlgoChanges::NoMutualCoercion, AlgoChanges::RequireDirect];
+        let mod_changes = &[
+            AlgoChanges::NoMutualCoercion,
+            AlgoChanges::RequireDirect,
+            AlgoChanges::DelayArms,
+        ];
+
+        let main_a = find_lub(order_a, deref, unsize, main_changes);
+        let mod_a = find_lub(order_a, deref, unsize, mod_changes);
+        let main_b = find_lub(order_b, deref, unsize, main_changes);
+        let mod_b = find_lub(order_b, deref, unsize, mod_changes);
+        assert_eq!(main_a, None);
+        assert_eq!(mod_a, None);
+        assert_eq!(main_b, None);
+        assert_eq!(
+            mod_b,
+            Some((
+                1,
+                vec![
+                    vec![(1, EdgeType::Deref)],
+                    vec![],
+                    vec![(1, EdgeType::Unsize)],
                 ]
             ))
         );
