@@ -407,14 +407,31 @@ fn main() -> anyhow::Result<()> {
         );
         println!("  Unique pairs: {}", unique_pairs.len());
 
-        write_graphs(&format!("target/{n}-deref.txt"), &deref_graphs)?;
-        write_graphs(&format!("target/{n}-unsize.txt"), &unsize_graphs)?;
+        // Build deduplicated graph lists and index mappings
+        let mut deref_map = HashMap::new();
+        let mut unsize_map = HashMap::new();
+        let mut unique_deref_graphs = Vec::new();
+        let mut unique_unsize_graphs = Vec::new();
+
+        for (deref, unsize) in &unique_pairs {
+            if !deref_map.contains_key(deref) {
+                deref_map.insert(deref.clone(), unique_deref_graphs.len());
+                unique_deref_graphs.push(deref.clone());
+            }
+            if !unsize_map.contains_key(unsize) {
+                unsize_map.insert(unsize.clone(), unique_unsize_graphs.len());
+                unique_unsize_graphs.push(unsize.clone());
+            }
+        }
+
+        write_graphs(&format!("target/{n}-deref.txt"), &unique_deref_graphs)?;
+        write_graphs(&format!("target/{n}-unsize.txt"), &unique_unsize_graphs)?;
 
         let total = unique_pairs.len();
         let mut count = 0;
         let mut stats = Stats::default();
         let mut paired_stats: HashMap<_, usize> = HashMap::new();
-        for (i, (deref, unsize)) in unique_pairs.iter().enumerate() {
+        for (deref, unsize) in unique_pairs.iter() {
             count += 1;
             if count % 10000 == 0 {
                 println!("  Progress: {}/{}", count, total);
@@ -422,9 +439,9 @@ fn main() -> anyhow::Result<()> {
 
             let res_main = do_find_inner(
                 Some(&mut file),
-                i, // Use index instead of di
+                deref_map[deref],
                 deref,
-                i, // Use index instead of ui
+                unsize_map[unsize],
                 unsize,
                 &[
                     AlgoChanges::RequireDirect,
@@ -434,9 +451,9 @@ fn main() -> anyhow::Result<()> {
             );
             let res_no_mut = do_find_inner(
                 Some(&mut file),
-                i, // Use index instead of di
+                deref_map[deref],
                 deref,
-                i, // Use index instead of ui
+                unsize_map[unsize],
                 unsize,
                 &[
                     AlgoChanges::RequireDirect,
