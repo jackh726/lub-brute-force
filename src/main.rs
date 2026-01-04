@@ -115,6 +115,7 @@ fn does_coerce(
 enum AlgoChanges {
     NoMutualCoercion,
     RequireDirect,
+    NoMultistep,
     DelayArms,
 }
 
@@ -130,11 +131,12 @@ fn find_lub(
     deref: &Graph,
     unsize: &Graph,
     changes: &[AlgoChanges],
-) -> Option<(NodeId, Vec<Adjustment>)> {
+) -> Result<(usize, Vec<Adjustment>), CoercionError> {
     tracing::debug!(deref = ?deref.to_adj_list(), unsize = ?unsize.to_adj_list());
     let mut lub = nodes[0];
     let mut adjustments_by_node = vec![vec![]; nodes.len()];
     let mut has_delayed_arms = false;
+    let mut multistep_coercion_found = false;
 
     for (i, node) in nodes.iter().copied().enumerate() {
         let arm_span = tracing::debug_span!("arm coercion", ?node, ?lub, ?adjustments_by_node);
@@ -173,12 +175,18 @@ fn find_lub(
             && changes.contains(&AlgoChanges::NoMutualCoercion)
         {
             tracing::debug!("mutual coercion found -> bailing");
-            return None;
+            return Err(CoercionError::NonSymmetricMutualCoercion);
         }
 
         if let Some(coerce) = coerce_to_lub {
             adjustments_by_node[node].extend(coerce);
             continue;
+        }
+
+        if changes.contains(&AlgoChanges::NoMultistep) {
+            assert!(!changes.contains(&AlgoChanges::RequireDirect));
+            tracing::debug!("no multistep coercions allowed -> marking as error");
+            multistep_coercion_found = true;
         }
 
         if !changes.contains(&AlgoChanges::RequireDirect) {
@@ -202,7 +210,7 @@ fn find_lub(
                             any_failed = true;
                         } else {
                             tracing::debug!(?j, ?node, "no direct coercion available");
-                            return None;
+                            return Err(CoercionError::NoDirectCoercionFound);
                         }
                     }
                 }
@@ -215,15 +223,20 @@ fn find_lub(
         if changes.contains(&AlgoChanges::DelayArms) {
             has_delayed_arms = true;
         } else {
-            return None;
+            return Err(CoercionError::NotFound);
         }
+    }
+
+    if multistep_coercion_found {
+        assert!(changes.contains(&AlgoChanges::NoMultistep));
+        return Err(CoercionError::MultistepCoercion);
     }
 
     if has_delayed_arms {
         assert!(changes.contains(&AlgoChanges::DelayArms));
-        None
+        Err(CoercionError::NotFound)
     } else {
-        Some((lub, adjustments_by_node))
+        Ok((lub, adjustments_by_node))
     }
 }
 
@@ -238,7 +251,13 @@ fn write_graphs(file: &str, graphs: &[Graph]) -> anyhow::Result<()> {
 }
 
 #[allow(dead_code)]
-fn error_string(error: &Error, di: usize, deref: &Graph, ui: usize, unsize: &Graph) -> String {
+fn error_string(
+    error: &CoercionSetError,
+    di: usize,
+    deref: &Graph,
+    ui: usize,
+    unsize: &Graph,
+) -> String {
     let mut mismatch_string = "\n".to_string();
     writeln!(mismatch_string, "!!! MISMATCH FOUND ({:?}) !!!", error.kind).unwrap();
     writeln!(
@@ -270,8 +289,16 @@ fn print_map<K: Debug, V: Debug>(map: &HashMap<K, V>) -> String {
     ret
 }
 
-#[derive(Clone, Debug)]
-struct Error {
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum CoercionError {
+    NonSymmetricMutualCoercion,
+    MultistepCoercion,
+    NoDirectCoercionFound,
+    NotFound,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CoercionSetError {
     kind: ErrorKind,
     error_data: HashSet<ErrorData>,
 }
@@ -291,7 +318,7 @@ enum ErrorKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ErrorData {
     order: Vec<NodeId>,
-    result: Option<(usize, Vec<Adjustment>)>,
+    result: Result<(usize, Vec<Adjustment>), CoercionError>,
 }
 
 fn do_find_inner(
@@ -301,7 +328,7 @@ fn do_find_inner(
     ui: usize,
     unsize: &Graph,
     changes: &[AlgoChanges],
-) -> Result<Option<(usize, Vec<Adjustment>)>, Box<Error>> {
+) -> Result<Result<(usize, Vec<Adjustment>), CoercionError>, Box<CoercionSetError>> {
     use itertools::Itertools;
 
     let orderings: Vec<Vec<_>> = (0..deref.len()).permutations(deref.len()).collect();
@@ -333,13 +360,11 @@ fn do_find_inner(
         let (second, second_order) = perm.next().unwrap();
 
         let error_kind = match (&first, &second) {
-            (Some(first), Some(second)) if first.0 != second.0 => ErrorKind::DifferentLUBs,
+            (Ok(first), Ok(second)) if first.0 != second.0 => ErrorKind::DifferentLUBs,
 
-            (None, Some(_)) | (Some(_), None) => ErrorKind::MissingLUB,
-            (Some(first), Some(second)) if first != second => {
-                ErrorKind::DifferentAdjustments(first.0)
-            }
-            (Some(_), Some(_)) | (None, None) => continue,
+            (Err(_), Ok(_)) | (Ok(_), Err(_)) => ErrorKind::MissingLUB,
+            (Ok(first), Ok(second)) if first != second => ErrorKind::DifferentAdjustments(first.0),
+            (Ok(_), Ok(_)) | (Err(_), Err(_)) => continue,
         };
 
         errors.insert(ErrorData {
@@ -363,7 +388,7 @@ fn do_find_inner(
     }
 
     match error {
-        Some(kind) => Err(Box::new(Error {
+        Some(kind) => Err(Box::new(CoercionSetError {
             kind,
             error_data: errors,
         })),
@@ -444,8 +469,9 @@ fn main() -> anyhow::Result<()> {
                 unsize_map[unsize],
                 unsize,
                 &[
-                    AlgoChanges::RequireDirect,
-                    AlgoChanges::NoMutualCoercion,
+                    //AlgoChanges::RequireDirect,
+                    //AlgoChanges::NoMultistep,
+                    //AlgoChanges::NoMutualCoercion,
                     //AlgoChanges::DelayArms,
                 ],
             );
@@ -456,54 +482,12 @@ fn main() -> anyhow::Result<()> {
                 unsize_map[unsize],
                 unsize,
                 &[
-                    AlgoChanges::RequireDirect,
+                    //AlgoChanges::RequireDirect,
+                    AlgoChanges::NoMultistep,
                     AlgoChanges::NoMutualCoercion,
-                    AlgoChanges::DelayArms,
+                    //AlgoChanges::DelayArms,
                 ],
             );
-            match (&res_main, &res_no_mut) {
-                (Ok(Some(v)), Ok(None)) => {
-                    *paired_stats.entry((Ok(Some(v.0)), Ok(None))).or_default() += 1;
-                    //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
-                }
-                (Ok(None), Ok(Some(v))) => {
-                    *paired_stats.entry((Ok(None), Ok(Some(v.0)))).or_default() += 1;
-                }
-                (Ok(Some(v1)), Ok(Some(v2))) => {
-                    *paired_stats
-                        .entry((Ok(Some(v1.0)), Ok(Some(v2.0))))
-                        .or_default() += 1;
-                }
-                (Ok(None), Ok(None)) => {
-                    *paired_stats.entry((Ok(None), Ok(None))).or_default() += 1;
-                }
-                (Err(e1), Err(e2)) => {
-                    *paired_stats
-                        .entry((Err(e1.kind), Err(e2.kind)))
-                        .or_default() += 1;
-                    //tracing::info!(main_error = display(error_string(&**e1, di, deref, ui, unsize)), change_error = display(error_string(&**e2, di, deref, ui, unsize)), "change in behavior");
-                }
-                (Ok(Some(v)), Err(e)) => {
-                    *paired_stats
-                        .entry((Ok(Some(v.0)), Err(e.kind)))
-                        .or_default() += 1;
-                    //tracing::info!(?res_main, change_error = display(error_string(&**e, di, deref, ui, unsize)), "change in behavior");
-                }
-                (Ok(None), Err(e)) => {
-                    *paired_stats.entry((Ok(None), Err(e.kind))).or_default() += 1;
-                    //tracing::info!(?res_main, change_error = display(error_string(&**e, i, deref, i, unsize)), "change in behavior");
-                }
-                (Err(e), Ok(None)) => {
-                    *paired_stats.entry((Err(e.kind), Ok(None))).or_default() += 1;
-                    //tracing::info!(main_error = display(error_string(&**e, i, deref, i, unsize)), ?res_no_mut, "change in behavior");
-                }
-                (Err(e), Ok(Some(v))) => {
-                    *paired_stats
-                        .entry((Err(e.kind), Ok(Some(v.0))))
-                        .or_default() += 1;
-                    //tracing::info!(main_error = display(error_string(&**e, i, deref, i, unsize)), ?res_no_mut, "change in behavior");
-                }
-            }
             match &res_no_mut {
                 Ok(_) => {
                     stats.no_mut_ok += 1;
@@ -511,6 +495,49 @@ fn main() -> anyhow::Result<()> {
                 Err(_) => {
                     stats.no_mut_err += 1;
                     //tracing::info!(?res_no_mut, "error in NoMututalCoercion");
+                }
+            }
+            if let Ok(Err(CoercionError::MultistepCoercion)) = res_no_mut {
+                tracing::info!(deref = ?deref.to_adj_list(), unsize = ?unsize.to_adj_list());
+                tracing::info!(?res_main, ?res_no_mut);
+            }
+            match (res_main, res_no_mut) {
+                (Ok(Ok(v)), Ok(Err(e))) => {
+                    *paired_stats.entry((Ok(Ok(v.0)), Ok(Err(e)))).or_default() += 1;
+                    //tracing::info!(?res_main, ?res_no_mut, "change in behavior");
+                }
+                (Ok(Err(e)), Ok(Ok(v))) => {
+                    *paired_stats.entry((Ok(Err(e)), Ok(Ok(v.0)))).or_default() += 1;
+                }
+                (Ok(Ok(v1)), Ok(Ok(v2))) => {
+                    *paired_stats
+                        .entry((Ok(Ok(v1.0)), Ok(Ok(v2.0))))
+                        .or_default() += 1;
+                }
+                (Ok(Err(e1)), Ok(Err(e2))) => {
+                    *paired_stats.entry((Ok(Err(e1)), Ok(Err(e2)))).or_default() += 1;
+                }
+                (Err(e1), Err(e2)) => {
+                    *paired_stats
+                        .entry((Err(e1.kind), Err(e2.kind)))
+                        .or_default() += 1;
+                    //tracing::info!(main_error = display(error_string(&**e1, di, deref, ui, unsize)), change_error = display(error_string(&**e2, di, deref, ui, unsize)), "change in behavior");
+                }
+                (Ok(Ok(v)), Err(e)) => {
+                    *paired_stats.entry((Ok(Ok(v.0)), Err(e.kind))).or_default() += 1;
+                    //tracing::info!(?res_main, change_error = display(error_string(&**e, di, deref, ui, unsize)), "change in behavior");
+                }
+                (Ok(Err(e1)), Err(e2)) => {
+                    *paired_stats.entry((Ok(Err(e1)), Err(e2.kind))).or_default() += 1;
+                    //tracing::info!(?res_main, change_error = display(error_string(&**e, i, deref, i, unsize)), "change in behavior");
+                }
+                (Err(e1), Ok(Err(e2))) => {
+                    *paired_stats.entry((Err(e1.kind), Ok(Err(e2)))).or_default() += 1;
+                    //tracing::info!(main_error = display(error_string(&**e, i, deref, i, unsize)), ?res_no_mut, "change in behavior");
+                }
+                (Err(e), Ok(Ok(v))) => {
+                    *paired_stats.entry((Err(e.kind), Ok(Ok(v.0)))).or_default() += 1;
+                    //tracing::info!(main_error = display(error_string(&**e, i, deref, i, unsize)), ?res_no_mut, "change in behavior");
                 }
             }
         }
@@ -546,11 +573,11 @@ mod test {
             unsize,
             &[AlgoChanges::NoMutualCoercion, AlgoChanges::RequireDirect],
         );
-        assert_eq!(main_a, None);
-        assert_eq!(mod_a, None);
+        assert_eq!(main_a, Err(CoercionError::NotFound));
+        assert_eq!(mod_a, Err(CoercionError::NotFound));
         assert_eq!(
             main_b,
-            Some((
+            Ok((
                 3,
                 vec![
                     vec![(1, EdgeType::Deref), (3, EdgeType::Deref)],
@@ -562,7 +589,7 @@ mod test {
         );
         assert_eq!(
             mod_b,
-            Some((
+            Ok((
                 3,
                 vec![
                     vec![(1, EdgeType::Deref), (3, EdgeType::Deref)],
@@ -593,12 +620,12 @@ mod test {
         let mod_a = find_lub(order_a, deref, unsize, mod_changes);
         let main_b = find_lub(order_b, deref, unsize, main_changes);
         let mod_b = find_lub(order_b, deref, unsize, mod_changes);
-        assert_eq!(main_a, None);
-        assert_eq!(mod_a, None);
-        assert_eq!(main_b, None);
+        assert_eq!(main_a, Err(CoercionError::NotFound));
+        assert_eq!(mod_a, Err(CoercionError::NotFound));
+        assert_eq!(main_b, Err(CoercionError::NotFound));
         assert_eq!(
             mod_b,
-            Some((
+            Ok((
                 1,
                 vec![
                     vec![(1, EdgeType::Deref)],
